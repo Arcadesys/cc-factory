@@ -162,17 +162,11 @@ Optional module for structured logs and on-screen feedback.
 
 ---
 
-## **5. Build Strategy (Pluggable)**
+## **5. Build Strategy**
 
-The system should support swappable traversal algorithms:
+The system uses a **serpentine** traversal by default: left-to-right on each layer, alternating direction per row.
 
-* **Serpentine** (default; simple, reliable)
-* **Spiral**
-* **Layer-optimized** (horizontal printing)
-* **Material-grouped** (minimize swaps)
-* **Custom** (drop-in module)
-
-Build strategy is resolved during `INITIALIZE` and stored in `ctx.strategy`.
+Build order is computed during `INITIALIZE` and stored in `ctx.strategy`.
 
 ---
 
@@ -193,28 +187,27 @@ All library functions must fail gracefully.
 
 ## **7. File Structure (Reference)**
 
-```
-/src
-  /states
-    initialize.lua
-    build.lua
-    restock.lua
-    refuel.lua
-    blocked.lua
-    error.lua
-    done.lua
+Computercraft turtles run best with a flat disk layout. Use filename prefixes to keep related states and libraries grouped without subdirectories.
 
-  /libs
-    movement.lua
-    inventory.lua
-    placement.lua
-    parser.lua
-    navigation.lua
-    logger.lua
+```text
+state_initialize.lua
+state_build.lua
+state_restock.lua
+state_refuel.lua
+state_blocked.lua
+state_error.lua
+state_done.lua
 
-  main.lua
-  config.lua
-  schema.json (or schema.txt)
+lib_movement.lua
+lib_inventory.lua
+lib_placement.lua
+lib_parser.lua
+lib_navigation.lua
+lib_logger.lua
+
+main.lua
+config.lua
+schema.json (or schema.txt)
 ```
 
 ---
