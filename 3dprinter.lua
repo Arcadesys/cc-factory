@@ -9,9 +9,9 @@ Usage (on the turtle):
   3dprinter [schema.txt] [--offset x y z] [--facing dir] [--dry-run] [--verbose]
 
 Defaults:
-  * Schema path defaults to "schema_printer_sample.txt" in the same directory.
-  * Offset defaults to (0, 0, 1) so the print happens one block in front.
-  * Facing defaults to north. Adjust if your turtle starts facing another way.
+    * If no schema path is supplied, the script lists detected schemas and selects the first entry (the sample file if present).
+    * If no offset is provided, you will be prompted to choose a start cell; pressing Enter keeps option 2 (the block in front).
+    * Facing defaults to north. Adjust if your turtle starts facing another way.
 
 The script expects to run on a turtle with the cc-factory libraries on its disk.
 --]]
@@ -33,29 +33,125 @@ Usage:
   3dprinter [schema_path] [options]
 
 Options:
-  --offset <x> <y> <z>   Shift the build relative to the turtle (default 0 0 1)
+    --offset <x> <y> <z>   Skip the start-cell prompt and use these offsets directly
   --facing <dir>         Initial/home facing (north|south|east|west)
   --dry-run              Preview the build order without moving or placing
   --verbose              Enable verbose logging (debug level)
   --park <n>             Extra vertical clearance before parking (default 2)
   --travel-clearance <n> Extra height above target layer when traversing (default 1)
     --min-fuel <n>         Warn if the fuel level is below n before starting (default 80)
+    --list-schemas         Show detected schema files and exit
   --help                 Show this message
+
+If schema_path is omitted, the printer lists detected schemas and prompts for a choice.
 
 Example:
   3dprinter schema_printer_sample.txt --offset 0 0 3 --facing south
 ]]
 
+local START_CELL_OFFSETS = {
+    [1] = { x = -1, z = -1 },
+    [2] = { x = 0,  z = -1 },
+    [3] = { x = 1,  z = -1 },
+    [4] = { x = -1, z = 0 },
+    [5] = { x = 1,  z = 0 },
+    [6] = { x = -1, z = 1 },
+    [7] = { x = 0,  z = 1 },
+    [8] = { x = 1,  z = 1 },
+}
+
+local function normaliseFacing(facing)
+    facing = type(facing) == "string" and facing:lower() or "north"
+    if facing ~= "north" and facing ~= "east" and facing ~= "south" and facing ~= "west" then
+        return "north"
+    end
+    return facing
+end
+
+local function facingVectors(facing)
+    facing = normaliseFacing(facing)
+    if facing == "north" then
+        return { forward = { x = 0, z = -1 }, right = { x = 1, z = 0 } }
+    elseif facing == "east" then
+        return { forward = { x = 1, z = 0 }, right = { x = 0, z = 1 } }
+    elseif facing == "south" then
+        return { forward = { x = 0, z = 1 }, right = { x = -1, z = 0 } }
+    else -- west
+        return { forward = { x = -1, z = 0 }, right = { x = 0, z = -1 } }
+    end
+end
+
+local function rotateLocalOffset(localOffset, facing)
+    local vectors = facingVectors(facing)
+    local dx = localOffset.x or 0
+    local dz = localOffset.z or 0
+    local right = vectors.right
+    local forward = vectors.forward
+    return {
+        x = (right.x * dx) + (forward.x * (-dz)),
+        z = (right.z * dx) + (forward.z * (-dz)),
+    }
+end
+
+local function promptStartCell(opts, logger)
+    if opts.offsetProvided then
+        return
+    end
+
+    local selection = 2
+    if type(read) == "function" then
+        print("")
+        print("Select build start location relative to the turtle (arrow = front):")
+        print(" [1][2][3]")
+        print(" [4][^][5]")
+        print(" [6][7][8]")
+
+        while true do
+            if type(write) == "function" then
+                write("Enter 1-8 (default 2): ")
+            else
+                print("Enter 1-8 (default 2): ")
+            end
+            local response = read()
+            if not response or response == "" then
+                break
+            end
+            local value = tonumber(response)
+            if value and START_CELL_OFFSETS[value] then
+                selection = value
+                break
+            end
+            print("Please enter a number between 1 and 8.")
+        end
+    elseif logger then
+        logger:info("Input unavailable; defaulting start location to 2 (front).")
+    end
+
+    local offsetLocal = START_CELL_OFFSETS[selection] or START_CELL_OFFSETS[2]
+    local rotated = rotateLocalOffset(offsetLocal, opts.facing)
+    opts.offset = {
+        x = rotated.x,
+        y = 0,
+        z = rotated.z,
+    }
+    opts.startCell = selection
+    if logger then
+        logger:info(string.format("Using start cell %d (offset x=%d, z=%d)", selection, opts.offset.x, opts.offset.z))
+    end
+end
+
 local function parseArgs(raw)
     local opts = {
         schemaPath = nil,
-        offset = { x = 0, y = 0, z = 1 },
+        offset = nil,
+        offsetProvided = false,
         facing = "north",
         dryRun = false,
         verbose = false,
         parkClearance = 2,
         travelClearance = 1,
         minFuel = 80,
+        listSchemas = false,
     }
 
     local i = 1
@@ -90,6 +186,7 @@ local function parseArgs(raw)
                 return opts
             end
             opts.offset = { x = ox, y = oy, z = oz }
+            opts.offsetProvided = true
             i = i + 4
         elseif arg == "--park" then
             local value = raw[i + 1]
@@ -130,6 +227,9 @@ local function parseArgs(raw)
             end
             opts.minFuel = math.max(0, math.floor(num))
             i = i + 2
+        elseif arg == "--list-schemas" then
+            opts.listSchemas = true
+            i = i + 1
         else
             if not opts.schemaPath then
                 opts.schemaPath = arg
@@ -141,11 +241,108 @@ local function parseArgs(raw)
         end
     end
 
-    if not opts.schemaPath or opts.schemaPath == "" then
-        opts.schemaPath = "schema_printer_sample.txt"
-    end
-
     return opts
+end
+
+local SCHEMA_EXTENSIONS = {
+    txt = true,
+    json = true,
+    grid = true,
+    vox = true,
+    voxel = true,
+    schem = true,
+    schematic = true,
+}
+
+local function collectSchemas(searchDir)
+    if not fs or type(fs.list) ~= "function" or type(fs.isDir) ~= "function" then
+        return {}
+    end
+    searchDir = searchDir or ""
+    local ok, entries = pcall(fs.list, searchDir)
+    if not ok or type(entries) ~= "table" then
+        return {}
+    end
+    local results = {}
+    for _, name in ipairs(entries) do
+        local path = searchDir ~= "" and fs.combine(searchDir, name) or name
+        if not fs.isDir(path) then
+            local ext = name:match("%.([%w_%-]+)$")
+            if ext then
+                ext = ext:lower()
+                if SCHEMA_EXTENSIONS[ext] then
+                    results[#results + 1] = path
+                end
+            end
+        end
+    end
+    table.sort(results)
+    return results
+end
+
+local function printSchemaList(schemaFiles)
+    if #schemaFiles == 0 then
+        print("No schema files found in the current directory.")
+        return
+    end
+    print("Detected schema files:")
+    for index, path in ipairs(schemaFiles) do
+        print(string.format("  [%d] %s", index, path))
+    end
+end
+
+local function resolveSchemaPath(opts, logger)
+    local candidates
+    if opts.listSchemas then
+        candidates = collectSchemas("")
+        printSchemaList(candidates)
+        return nil, "list_only"
+    end
+    if opts.schemaPath and opts.schemaPath ~= "" then
+        return opts.schemaPath
+    end
+    candidates = candidates or collectSchemas("")
+    if #candidates == 0 then
+        if logger then
+            logger:error("No schema files found; supply a path or add a schema_*.txt/json file.")
+        end
+        return nil, "no_schemas"
+    end
+    printSchemaList(candidates)
+    if #candidates == 1 then
+        local choice = candidates[1]
+        if logger then
+            logger:info(string.format("Only one schema detected; defaulting to %s", choice))
+        end
+        return choice
+    end
+    if type(read) ~= "function" then
+        local choice = candidates[1]
+        if logger then
+            logger:warn("Input unavailable; defaulting to first schema in list.")
+        end
+        return choice
+    end
+    while true do
+        local prompt = string.format("Select schema [1-%d] or enter a path (blank for 1): ", #candidates)
+        if type(write) == "function" then
+            write(prompt)
+        else
+            print(prompt)
+        end
+        local response = read()
+        if not response or response == "" then
+            return candidates[1]
+        end
+        local index = tonumber(response)
+        if index and candidates[index] then
+            return candidates[index]
+        end
+        if fs and type(fs.exists) == "function" and fs.exists(response) and not fs.isDir(response) then
+            return response
+        end
+        print("Invalid selection; try again.")
+    end
 end
 
 local function getBlock(schema, x, y, z)
@@ -531,6 +728,29 @@ local function run(rawArgs)
     end
 
     local logger = loggerLib.new({ level = opts.verbose and "debug" or "info", tag = "3dprinter", timestamps = false })
+
+    local selectedSchema, schemaErr = resolveSchemaPath(opts, logger)
+    if not selectedSchema then
+        if schemaErr == "list_only" then
+            return
+        end
+        return
+    end
+    opts.schemaPath = selectedSchema
+
+    if not opts.offsetProvided then
+        promptStartCell(opts, logger)
+    else
+        opts.offset = opts.offset or { x = 0, y = 0, z = 0 }
+        if logger then
+            logger:info(string.format("Using CLI offset x=%d y=%d z=%d", opts.offset.x, opts.offset.y, opts.offset.z))
+        end
+    end
+
+    if not opts.offset then
+        -- Fallback for non-interactive environments
+        opts.offset = { x = 0, y = 0, z = -1 }
+    end
 
     local ctx = {
         origin = { x = 0, y = 0, z = 0 },
