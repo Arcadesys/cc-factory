@@ -6,6 +6,7 @@ sample JSON, text-grid, and voxel inputs. Prompts allow testing custom files on 
 
 ---@diagnostic disable: undefined-global
 local parser = require("lib_parser")
+local common = require("harness_common")
 
 local createdArtifacts = {}
 
@@ -66,65 +67,26 @@ local function cleanupArtifacts()
     end
 end
 
-local function makeLogger(ctx)
-    local logger = {}
-
-    function logger.info(msg)
-        print("[INFO] " .. msg)
-    end
-
-    function logger.warn(msg)
-        print("[WARN] " .. msg)
-    end
-
-    function logger.error(msg)
-        print("[ERROR] " .. msg)
-    end
-
-    function logger.debug(msg)
-        if ctx.config and ctx.config.verbose then
-            print("[DEBUG] " .. msg)
-        end
-    end
-
-    return logger
-end
-
-local function prompt(message, default)
-    local suffix = ""
-    if default and default ~= "" then
-        suffix = " [" .. default .. "]"
-    end
-    print(message .. suffix)
-    local readFn = _G and _G["read"]
-    if type(readFn) == "function" then
-        local line = readFn()
-        if line and line ~= "" then
-            return line
-        end
-    else
-        local sleepFn = _G and _G["sleep"]
-        if type(sleepFn) == "function" then
-            sleepFn(2)
-        end
-    end
-    return default
-end
-
-local function printMaterials(info)
-    if not info or not info.materials or #info.materials == 0 then
-        print("Materials: <none>")
+local function printMaterials(io, info)
+    if not io.print then
         return
     end
-    print("Materials:")
+    if not info or not info.materials or #info.materials == 0 then
+        io.print("Materials: <none>")
+        return
+    end
+    io.print("Materials:")
     for _, entry in ipairs(info.materials) do
-        print(string.format(" - %s x%d", entry.material, entry.count))
+        io.print(string.format(" - %s x%d", entry.material, entry.count))
     end
 end
 
-local function printBounds(info)
+local function printBounds(io, info)
+    if not io.print then
+        return
+    end
     if not info or not info.bounds or not info.bounds.min then
-        print("Bounds: <unknown>")
+        io.print("Bounds: <unknown>")
         return
     end
     local minB = info.bounds.min
@@ -134,26 +96,24 @@ local function printBounds(info)
         y = (maxB.y - minB.y) + 1,
         z = (maxB.z - minB.z) + 1,
     }
-    print(string.format("Bounds: min(%d,%d,%d) max(%d,%d,%d) dims(%d,%d,%d)",
+    io.print(string.format("Bounds: min(%d,%d,%d) max(%d,%d,%d) dims(%d,%d,%d)",
         minB.x, minB.y, minB.z, maxB.x, maxB.y, maxB.z, dims.x, dims.y, dims.z))
 end
 
-local function summariseResult(ok, schema, info, err)
-    if not ok then
-        print("Result: FAIL - " .. tostring(err))
+local function emitParseSummary(io, schema, info)
+    if not io.print then
         return
     end
-    print("Result: PASS")
     info = info or {}
     if info.format then
-        print("Format: " .. tostring(info.format))
+        io.print("Format: " .. tostring(info.format))
     end
     if info.path then
-        print("Source: " .. tostring(info.path))
+        io.print("Source: " .. tostring(info.path))
     end
-    print("Total blocks: " .. tostring(info.totalBlocks or (schema and "~" .. tostring(#schema) or 0)))
-    printBounds(info)
-    printMaterials(info)
+    io.print("Total blocks: " .. tostring(info.totalBlocks or (schema and tostring(#schema) or 0)))
+    printBounds(io, info)
+    printMaterials(io, info)
 end
 
 local function toMaterialMap(list)
@@ -352,187 +312,206 @@ local FILE_SAMPLES = {
     },
 }
 
-local testStats = {
-    total = 0,
-    passed = 0,
-    failures = 0,
-    details = {},
-}
-
-local function recordResult(name, success, message)
-    testStats.total = testStats.total + 1
-    if success then
-        testStats.passed = testStats.passed + 1
-    else
-        testStats.failures = testStats.failures + 1
-        testStats.details[#testStats.details + 1] = {
-            name = name,
-            message = message or "unknown error",
-        }
-    end
-end
-
-local function runParseCall(ctx, label, parseCall, expect)
-    print("\n== " .. label .. " ==")
+local function executeParse(io, parseCall, expect)
     local callOk, resultOk, schemaOrErr, info = pcall(parseCall)
     if not callOk then
-        summariseResult(false, nil, nil, resultOk)
-        recordResult(label, false, tostring(resultOk))
-        return
+        if io.print then
+            io.print("Parser invocation errored: " .. tostring(resultOk))
+        end
+        return false, tostring(resultOk)
     end
     if not resultOk then
-        summariseResult(false, nil, nil, schemaOrErr)
-        recordResult(label, false, tostring(schemaOrErr))
-        return
+        if io.print then
+            io.print("Parser returned failure: " .. tostring(schemaOrErr))
+        end
+        return false, tostring(schemaOrErr)
     end
-    summariseResult(true, schemaOrErr, info)
+    emitParseSummary(io, schemaOrErr, info)
     local expectOk, expectErr = checkExpectations(info or {}, expect)
     if expect then
         if expectOk then
-            print("[PASS] Expectations met.")
+            if io.print then
+                io.print("[PASS] Expectations met.")
+            end
         else
-            print("[FAIL] " .. tostring(expectErr))
+            if io.print then
+                io.print("[FAIL] " .. tostring(expectErr))
+            end
+            return false, expectErr
         end
     end
-    recordResult(label, expectOk ~= false, expectErr)
+    return true
 end
 
-local function runSample(ctx, label, spec, expect)
-    runParseCall(ctx, label, function()
-        return parser.parse(ctx, spec)
-    end, expect)
-end
-
-local function runFileSample(ctx, label, path, contents, expect, opts)
-    runParseCall(ctx, label, function()
-        local ok, err = writeFile(path, contents)
+local function runFileSample(io, ctx, sample)
+    return executeParse(io, function()
+        local ok, err = writeFile(sample.path, sample.contents)
         if not ok then
             return false, err or "write_failed"
         end
-        stageArtifact(path)
-        return parser.parseFile(ctx, path, opts)
-    end, expect)
+        stageArtifact(sample.path)
+        return parser.parseFile(ctx, sample.path, sample.opts)
+    end, sample.expect)
 end
 
-local function runParseTextSample(ctx, label, text, expect)
-    runParseCall(ctx, label, function()
-        return parser.parseText(ctx, text)
-    end, expect)
+local function prepareContext(ctxOverrides, io)
+    local ctx = common.merge({ config = { verbose = true } }, ctxOverrides or {})
+    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
+    return ctx
 end
 
-local function runParseJsonSample(ctx, label, data, expect)
-    runParseCall(ctx, label, function()
-        return parser.parseJson(ctx, data)
-    end, expect)
-end
-
-local function runCustomPath(ctx)
-    local path = prompt("Enter path to schema file (JSON or text grid)", "schema.json")
+local function runCustomPath(io, ctx)
+    local path = common.promptInput(io, "Enter path to schema file (JSON or text grid)", "schema.json")
     if not path or path == "" then
-        print("Skipping custom file test.")
-        return
+        if io.print then
+            io.print("Skipping custom file test.")
+        end
+        return true
     end
-    print("\n== Parse File: " .. path .. " ==")
-    local ok, schemaOrErr, info = parser.parseFile(ctx, path, { formatHint = nil })
-    if not ok then
-        summariseResult(false, nil, nil, schemaOrErr)
-        recordResult("File: " .. path, false, tostring(schemaOrErr))
-    else
-        summariseResult(true, schemaOrErr, info)
-        recordResult("File: " .. path, true)
-    end
+    return executeParse(io, function()
+        return parser.parseFile(ctx, path, { formatHint = nil })
+    end)
 end
 
-local function runCustomText(ctx)
-    local mode = prompt("Enter format for raw text (json/grid)", "grid")
-    local text
-    if mode == "json" then
-        print("Paste JSON, end with empty line:")
-    else
-        print("Paste text grid, end with empty line:")
+local function runCustomText(io, ctx)
+    local mode = common.promptInput(io, "Enter format for raw text (json/grid)", "grid")
+    local promptMessage = mode == "json" and "Paste JSON, end with empty line:" or "Paste text grid, end with empty line:"
+    if io.print then
+        io.print(promptMessage)
     end
     local lines = {}
     while true do
-        local line = prompt("")
+        local line = common.prompt(io, "", { allowEmpty = true })
         if not line or line == "" then
             break
         end
         lines[#lines + 1] = line
     end
     if #lines == 0 then
-        print("No text entered, skipping.")
-        return
+        if io.print then
+            io.print("No text entered, skipping.")
+        end
+        return true
     end
-    text = table.concat(lines, "\n")
-    print("\n== Parse Raw Text ==")
-    local ok, schemaOrErr, info = parser.parse(ctx, { text = text, format = mode })
-    if not ok then
-        summariseResult(false, nil, nil, schemaOrErr)
-        recordResult("Raw text", false, tostring(schemaOrErr))
-    else
-        summariseResult(true, schemaOrErr, info)
-        recordResult("Raw text", true)
-    end
+    local text = table.concat(lines, "\n")
+    return executeParse(io, function()
+        return parser.parse(ctx, { text = text, format = mode })
+    end)
 end
 
-local function prepareContext()
-    local ctx = {
-        config = {
-            verbose = true,
-        },
-    }
-    ctx.logger = makeLogger(ctx)
-    return ctx
-end
+local function run(ctxOverrides, ioOverrides)
+    local io = common.resolveIo(ioOverrides)
+    local ctx = prepareContext(ctxOverrides, io)
 
-local function main()
-    local ctx = prepareContext()
+    if io.print then
+        io.print("Parser harness starting. Ensure sample schema files are available if you want to test custom paths.")
+    end
 
-    print("Parser harness starting. Ensure sample schema files are available if you want to test custom paths.")
+    local suite = common.createSuite({ name = "Parser Harness", io = io })
+    local step = function(name, fn)
+        return suite:step(name, fn)
+    end
 
-    runSample(ctx, "Sample Text Grid", { text = SAMPLE_TEXT_GRID, format = "grid" }, EXPECT_TEXT_GRID)
-    runSample(ctx, "Sample JSON", { text = SAMPLE_JSON, format = "json" }, EXPECT_JSON)
-    runSample(ctx, "Sample Voxel", { text = SAMPLE_VOXEL, format = "voxel" }, EXPECT_VOXEL)
-    runParseTextSample(ctx, "Sample Text Grid via parseText", SAMPLE_TEXT_GRID, EXPECT_TEXT_GRID)
-    runParseJsonSample(ctx, "Sample JSON Blocks via parseJson", SAMPLE_BLOCK_DATA, EXPECT_BLOCK_DATA)
-    runParseCall(ctx, "Sample Voxel via data", function()
-        return parser.parse(ctx, { data = SAMPLE_VOXEL_DATA, format = "voxel" })
-    end, EXPECT_VOXEL)
-    runParseCall(ctx, "Sample JSON direct source", function()
-        return parser.parse(ctx, SAMPLE_JSON)
-    end, EXPECT_JSON)
+    step("Sample Text Grid", function()
+        return executeParse(io, function()
+            return parser.parse(ctx, { text = SAMPLE_TEXT_GRID, format = "grid" })
+        end, EXPECT_TEXT_GRID)
+    end)
+
+    step("Sample JSON", function()
+        return executeParse(io, function()
+            return parser.parse(ctx, { text = SAMPLE_JSON, format = "json" })
+        end, EXPECT_JSON)
+    end)
+
+    step("Sample Voxel", function()
+        return executeParse(io, function()
+            return parser.parse(ctx, { text = SAMPLE_VOXEL, format = "voxel" })
+        end, EXPECT_VOXEL)
+    end)
+
+    step("Sample Text Grid via parseText", function()
+        return executeParse(io, function()
+            return parser.parseText(ctx, SAMPLE_TEXT_GRID)
+        end, EXPECT_TEXT_GRID)
+    end)
+
+    step("Sample JSON Blocks via parseJson", function()
+        return executeParse(io, function()
+            return parser.parseJson(ctx, SAMPLE_BLOCK_DATA)
+        end, EXPECT_BLOCK_DATA)
+    end)
+
+    step("Sample Voxel via data", function()
+        return executeParse(io, function()
+            return parser.parse(ctx, { data = SAMPLE_VOXEL_DATA, format = "voxel" })
+        end, EXPECT_VOXEL)
+    end)
+
+    step("Sample JSON direct source", function()
+        return executeParse(io, function()
+            return parser.parse(ctx, SAMPLE_JSON)
+        end, EXPECT_JSON)
+    end)
+
     for _, sample in ipairs(FILE_SAMPLES) do
-        runFileSample(ctx, sample.label, sample.path, sample.contents, sample.expect, sample.opts)
+        step(sample.label, function()
+            return runFileSample(io, ctx, sample)
+        end)
     end
-    runParseCall(ctx, "File autodetect via parse", function()
+
+    step("File autodetect via parse", function()
         local sample = FILE_SAMPLES[1]
-        local ok, err = writeFile(sample.path, sample.contents)
-        if not ok then
-            return false, err or "write_failed"
+        return executeParse(io, function()
+            local ok, err = writeFile(sample.path, sample.contents)
+            if not ok then
+                return false, err or "write_failed"
+            end
+            stageArtifact(sample.path)
+            return parser.parse(ctx, { source = sample.path })
+        end, EXPECT_TEXT_GRID)
+    end)
+
+    local customFileAnswer = common.promptInput(io, "Run custom file test? (y/n)", "n")
+    if customFileAnswer == "y" then
+        step("Custom file test", function()
+            return runCustomPath(io, ctx)
+        end)
+    end
+
+    local customTextAnswer = common.promptInput(io, "Run custom raw text test? (y/n)", "n")
+    if customTextAnswer == "y" then
+        step("Custom raw text", function()
+            return runCustomText(io, ctx)
+        end)
+    end
+
+    suite:summary()
+
+    local passed = 0
+    for _, result in ipairs(suite.results) do
+        if result.ok then
+            passed = passed + 1
         end
-        stageArtifact(sample.path)
-        return parser.parse(ctx, { source = sample.path })
-    end, EXPECT_TEXT_GRID)
-
-    if prompt("Run custom file test? (y/n)", "n") == "y" then
-        runCustomPath(ctx)
     end
-    if prompt("Run custom raw text test? (y/n)", "n") == "y" then
-        runCustomText(ctx)
+    if io.print then
+        io.print(string.format("Tests: %d passed / %d total", passed, #suite.results))
+        if passed == #suite.results then
+            io.print("All parser harness tests passed.")
+        else
+            io.print("Some parser harness tests failed.")
+        end
     end
 
-    print("\nHarness complete. Review the results above for details.")
-    print(string.format("Tests: %d passed / %d total", testStats.passed, testStats.total))
     cleanupArtifacts()
-    if testStats.failures > 0 then
-        print("Failures:")
-        for _, failure in ipairs(testStats.details) do
-            print(string.format(" - %s: %s", failure.name, failure.message))
-        end
-        error("Parser harness detected failures.")
-    else
-        print("All parser harness tests passed.")
-    end
+    return suite
 end
 
-main()
+local M = { run = run }
+
+local args = { ... }
+if #args == 0 then
+    run()
+end
+
+return M

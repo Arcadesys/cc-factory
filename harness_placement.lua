@@ -6,6 +6,19 @@ Run on a CC:Tweaked turtle to exercise placement helpers and build-state logic.
 ---@diagnostic disable: undefined-global, undefined-field
 local placement = require("lib_placement")
 local movement = require("lib_movement")
+local common = require("harness_common")
+
+local BASE_CONTEXT = {
+    origin = { x = 0, y = 0, z = 0 },
+    pointer = { x = 0, y = 0, z = 0 },
+    state = "BUILD",
+    config = {
+        verbose = true,
+        allowOverwrite = false,
+        defaultPlacementSide = "forward",
+        fuelThreshold = 0,
+    },
+}
 
 local function copyPosition(pos)
     if type(pos) ~= "table" then
@@ -18,41 +31,6 @@ local function setSchemaBlock(schema, pos, block)
     schema[pos.x] = schema[pos.x] or {}
     schema[pos.x][pos.y] = schema[pos.x][pos.y] or {}
     schema[pos.x][pos.y][pos.z] = block
-end
-
-local function makeLogger(ctx)
-    local logger = {}
-
-    function logger.info(msg)
-        print("[INFO] " .. msg)
-    end
-
-    function logger.warn(msg)
-        print("[WARN] " .. msg)
-    end
-
-    function logger.error(msg)
-        print("[ERROR] " .. msg)
-    end
-
-    function logger.debug(msg)
-        if ctx.config and ctx.config.verbose then
-            print("[DEBUG] " .. msg)
-        end
-    end
-
-    return logger
-end
-
-local function prompt(message)
-    print(message)
-    if _G.read then
-        read()
-    else
-        if _G.sleep then
-            sleep(3)
-        end
-    end
 end
 
 local function hasMaterial(material)
@@ -68,29 +46,33 @@ local function hasMaterial(material)
     return false
 end
 
-local function ensureMaterialPresent(material)
+local function ensureMaterialPresent(io, material)
     if not turtle or not turtle.getItemDetail then
         return
     end
     if hasMaterial(material) then
         return
     end
-    print("Turtle is missing " .. material .. ". Load it, then press Enter.")
+    if io.print then
+        io.print("Turtle is missing " .. material .. ". Load it, then press Enter.")
+    end
     repeat
-        prompt("")
+        common.promptEnter(io, "")
     until hasMaterial(material)
 end
 
-local function ensureMaterialAbsent(material)
+local function ensureMaterialAbsent(io, material)
     if not turtle or not turtle.getItemDetail then
         return
     end
     if not hasMaterial(material) then
         return
     end
-    print("Remove all " .. material .. " from the turtle inventory, then press Enter.")
+    if io.print then
+        io.print("Remove all " .. material .. " from the turtle inventory, then press Enter.")
+    end
     repeat
-        prompt("")
+        common.promptEnter(io, "")
     until not hasMaterial(material)
 end
 
@@ -122,15 +104,18 @@ local function computeManifest(list)
     return totals
 end
 
-local function printManifest(manifest)
-    print("\nRequested manifest (minimum counts):")
+local function printManifest(io, manifest)
+    if not io.print then
+        return
+    end
+    io.print("\nRequested manifest (minimum counts):")
     local shown = false
     for material, count in pairs(manifest) do
-        print(string.format(" - %s x%d", material, count))
+        io.print(string.format(" - %s x%d", material, count))
         shown = true
     end
     if not shown then
-        print(" - <empty>")
+        io.print(" - <empty>")
     end
 end
 
@@ -168,8 +153,8 @@ local scenarios = {
         meta = { side = "forward", overwrite = true, dig = false, attack = false },
         prompt = "Place an indestructible block in front (e.g., obsidian). Turtle should switch to BLOCKED.",
         expect = "BLOCKED",
-        after = function()
-            prompt("Break the blocking block before continuing.")
+        after = function(io)
+            common.promptEnter(io, "Break the blocking block before continuing.")
         end,
     },
     {
@@ -183,90 +168,105 @@ local scenarios = {
     },
 }
 
-local function newContext(def)
-    local ctx = {
-        origin = { x = 0, y = 0, z = 0 },
-        pointer = copyPosition(def.pointer),
-        state = "BUILD",
-        config = {
-            verbose = true,
-            allowOverwrite = def.meta and def.meta.overwrite or false,
-            defaultPlacementSide = "forward",
-            fuelThreshold = 0,
-        },
-    }
-
-    ctx.logger = makeLogger(ctx)
+local function newContext(def, ctxOverrides, io)
+    local ctx = common.merge(BASE_CONTEXT, ctxOverrides or {})
+    ctx.pointer = copyPosition(def.pointer or ctx.pointer)
+    if ctx.config then
+        ctx.config.allowOverwrite = def.meta and def.meta.overwrite or ctx.config.allowOverwrite
+    end
+    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
     ctx.schema = {}
     setSchemaBlock(ctx.schema, ctx.pointer, {
         material = def.material,
         meta = def.meta,
     })
-
     ctx.strategy = {
         order = { copyPosition(ctx.pointer) },
         index = 1,
     }
-
     placement.ensureState(ctx)
     movement.ensureState(ctx)
     return ctx
 end
 
-local function runScenario(def)
-    print("\n== " .. def.name .. " ==")
-    if def.prompt then
-        print(def.prompt)
+local function runScenario(io, def, ctxOverrides)
+    if io.print then
+        io.print("\nScenario: " .. def.name)
+        if def.prompt then
+            io.print(def.prompt)
+        end
     end
 
     if def.inventory == "present" then
-        ensureMaterialPresent(def.material)
+        ensureMaterialPresent(io, def.material)
     elseif def.inventory == "absent" then
-        ensureMaterialAbsent(def.material)
+        ensureMaterialAbsent(io, def.material)
     end
 
-    prompt("Press Enter to execute placement.")
+    common.promptEnter(io, "Press Enter to execute placement.")
 
-    local ctx = newContext(def)
+    local ctx = newContext(def, ctxOverrides, io)
     local nextState, detail = placement.executeBuildState(ctx, def.opts or {})
 
-    print("Next state: " .. tostring(nextState))
+    if io.print then
+        io.print("Next state: " .. tostring(nextState))
+        if detail then
+            io.print("Detail: " .. detailToString(detail))
+        end
+        if ctx.placement and ctx.placement.lastPlacement then
+            io.print("Placement summary: " .. detailToString(ctx.placement.lastPlacement))
+        end
+    end
+
     if def.expect and def.expect ~= nextState then
-        print("[WARN] Expected " .. tostring(def.expect) .. " but observed " .. tostring(nextState))
-    end
-
-    if detail then
-        print("Detail: " .. detailToString(detail))
-    end
-
-    if ctx.placement and ctx.placement.lastPlacement then
-        print("Placement summary: " .. detailToString(ctx.placement.lastPlacement))
+        return false, string.format("expected %s but observed %s", tostring(def.expect), tostring(nextState))
     end
 
     if def.after then
-        def.after()
+        def.after(io)
     else
-        prompt("Press Enter when ready for the next scenario.")
+        common.promptEnter(io, "Press Enter when ready for the next scenario.")
     end
+
+    return true
 end
 
-local function main()
+local function run(ctxOverrides, ioOverrides)
     if not turtle then
         error("turtle API unavailable. Run this on a CC:Tweaked turtle.")
     end
 
-    print("Placement harness starting.")
-    print("Ensure the turtle has fuel, faces north, and sits at the chosen origin before continuing.")
+    local io = common.resolveIo(ioOverrides)
 
-    local manifest = computeManifest(scenarios)
-    printManifest(manifest)
-    prompt("Gather at least the listed materials before continuing. Press Enter once ready.")
-
-    for _, def in ipairs(scenarios) do
-        runScenario(def)
+    if io.print then
+        io.print("Placement harness starting.")
+        io.print("Ensure the turtle has fuel, faces north, and sits at the chosen origin before continuing.")
     end
 
-    print("\nHarness complete. Review the results above for any failures.")
+    local manifest = computeManifest(scenarios)
+    printManifest(io, manifest)
+    common.promptEnter(io, "Gather at least the listed materials before continuing. Press Enter once ready.")
+
+    local suite = common.createSuite({ name = "Placement Harness", io = io })
+    local step = function(name, fn)
+        return suite:step(name, fn)
+    end
+
+    for _, def in ipairs(scenarios) do
+        step(def.name, function()
+            return runScenario(io, def, ctxOverrides)
+        end)
+    end
+
+    suite:summary()
+    return suite
 end
 
-main()
+local M = { run = run }
+
+local args = { ... }
+if #args == 0 then
+    run()
+end
+
+return M
