@@ -3,8 +3,8 @@ legend:
 S = minecraft:stone
 P = minecraft:oak_planks
 L = minecraft:lantern
-T = mekanism:logistical_transporter
-U = mekanism:universal_cable
+T = mekanism:basic_logistical_transporter
+U = mekanism:basic_universal_cable
 . = minecraft:air
 
 layer:0

@@ -902,27 +902,18 @@ local function run(rawArgs)
                 break
             end
             if fuelStatus and fuelStatus.level then
-                    threshold = (opts.minFuel and opts.minFuel > 0) and opts.minFuel or nil,
-                    lastKnown = nil,
-                    reserve = (opts.minFuel and opts.minFuel > 0) and math.max(opts.minFuel * 2, opts.minFuel + 64) or nil,
+                ctx.fuelState = ctx.fuelState or {}
+                ctx.fuelState.lastKnown = fuelStatus.level
+            end
+
             local travelOk, travelErr = travelTo(ctx, step.approach, opts.travelClearance)
             if not travelOk then
                 local level, limit = readFuel()
                 if level then
                     local suffix = limit and string.format("/%d", limit) or ""
-            ensureFacing(ctx, opts.facing, logger)
                     logger:error(string.format("Fuel remaining at failure: %d%s", level, suffix))
                     if level <= 0 then
                         logger:error("Turtle is out of fuel; supply fuel and rerun.")
-
-            local fuelOk, fuelLevel = ensureInitialFuel(ctx, logger, opts.minFuel)
-            if not fuelOk then
-                return
-            end
-            if ctx.fuelState then
-                ctx.fuelState.lastKnown = fuelLevel
-            end
-            ensureFacing(ctx, opts.facing, logger)
                     end
                 end
                 logger:error("Movement failed: " .. tostring(travelErr))
@@ -930,6 +921,7 @@ local function run(rawArgs)
                 break
             end
 
+            ensureFacing(ctx, opts.facing, logger)
             local placed, placeInfo = placement.placeMaterial(ctx, step.block.material, { side = step.side, block = step.block, dig = true, attack = true })
             if not placed then
                 logger:error("Placement failed: " .. tostring(placeInfo))
