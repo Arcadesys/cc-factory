@@ -7,6 +7,65 @@ sample JSON, text-grid, and voxel inputs. Prompts allow testing custom files on 
 ---@diagnostic disable: undefined-global
 local parser = require("lib_parser")
 
+local createdArtifacts = {}
+
+local function stageArtifact(path)
+    for _, existing in ipairs(createdArtifacts) do
+        if existing == path then
+            return
+        end
+    end
+    createdArtifacts[#createdArtifacts + 1] = path
+end
+
+local function writeFile(path, contents)
+    if type(path) ~= "string" or path == "" then
+        return false, "invalid_path"
+    end
+    if fs and fs.open then
+        local handle = fs.open(path, "w")
+        if not handle then
+            return false, "open_failed"
+        end
+        handle.write(contents)
+        handle.close()
+        return true
+    end
+    if io and io.open then
+        local handle, err = io.open(path, "w")
+        if not handle then
+            return false, err or "open_failed"
+        end
+        handle:write(contents)
+        handle:close()
+        return true
+    end
+    return false, "fs_unavailable"
+end
+
+local function deleteFile(path)
+    if fs and fs.delete and fs.exists then
+        local ok, exists = pcall(fs.exists, path)
+        if ok and exists then
+            fs.delete(path)
+        end
+        return true
+    end
+    if os and os.remove then
+        os.remove(path)
+        return true
+    end
+    return false
+end
+
+local function cleanupArtifacts()
+    for index = #createdArtifacts, 1, -1 do
+        local path = createdArtifacts[index]
+        deleteFile(path)
+        createdArtifacts[index] = nil
+    end
+end
+
 local function makeLogger(ctx)
     local logger = {}
 
@@ -238,6 +297,61 @@ local EXPECT_VOXEL = {
     },
 }
 
+local SAMPLE_BLOCK_DATA = {
+    blocks = {
+        { x = 0, y = 0, z = 0, material = "minecraft:cobblestone" },
+        { x = 1, y = 0, z = 0, material = "minecraft:stone" },
+        { x = 0, y = 1, z = 0, material = "minecraft:stone" },
+    },
+}
+
+local SAMPLE_VOXEL_DATA = {
+    grid = {
+        [0] = {
+            [0] = { [0] = "minecraft:oak_log", [1] = "minecraft:oak_log" },
+            [1] = { [0] = "minecraft:oak_leaves", [1] = "minecraft:oak_leaves" },
+        },
+        [1] = {
+            [0] = { [0] = "minecraft:oak_leaves", [1] = "minecraft:oak_leaves" },
+            [1] = { [0] = "minecraft:air", [1] = "minecraft:torch" },
+        },
+    },
+}
+
+local EXPECT_BLOCK_DATA = {
+    totalBlocks = 3,
+    materials = {
+        ["minecraft:cobblestone"] = 1,
+        ["minecraft:stone"] = 2,
+    },
+    bounds = {
+        min = { x = 0, y = 0, z = 0 },
+        max = { x = 1, y = 1, z = 0 },
+    },
+}
+
+local FILE_SAMPLES = {
+    {
+        label = "File Text Grid",
+        path = "tmp_sample_grid.txt",
+        contents = SAMPLE_TEXT_GRID,
+        expect = EXPECT_TEXT_GRID,
+    },
+    {
+        label = "File JSON",
+        path = "tmp_sample_schema.json",
+        contents = SAMPLE_JSON,
+        expect = EXPECT_JSON,
+    },
+    {
+        label = "File Voxel",
+        path = "tmp_sample_voxel.vox",
+        contents = SAMPLE_VOXEL,
+        expect = EXPECT_VOXEL,
+        opts = { formatHint = "voxel" },
+    },
+}
+
 local testStats = {
     total = 0,
     passed = 0,
@@ -258,24 +372,58 @@ local function recordResult(name, success, message)
     end
 end
 
-local function runSample(ctx, label, spec, expect)
+local function runParseCall(ctx, label, parseCall, expect)
     print("\n== " .. label .. " ==")
-    local ok, schemaOrErr, info = parser.parse(ctx, spec)
-    if not ok then
+    local callOk, resultOk, schemaOrErr, info = pcall(parseCall)
+    if not callOk then
+        summariseResult(false, nil, nil, resultOk)
+        recordResult(label, false, tostring(resultOk))
+        return
+    end
+    if not resultOk then
         summariseResult(false, nil, nil, schemaOrErr)
         recordResult(label, false, tostring(schemaOrErr))
-    else
-        summariseResult(true, schemaOrErr, info)
-        local expectOk, expectErr = checkExpectations(info or {}, expect)
-        if expect then
-            if expectOk then
-                print("[PASS] Expectations met.")
-            else
-                print("[FAIL] " .. tostring(expectErr))
-            end
-        end
-        recordResult(label, expectOk ~= false, expectErr)
+        return
     end
+    summariseResult(true, schemaOrErr, info)
+    local expectOk, expectErr = checkExpectations(info or {}, expect)
+    if expect then
+        if expectOk then
+            print("[PASS] Expectations met.")
+        else
+            print("[FAIL] " .. tostring(expectErr))
+        end
+    end
+    recordResult(label, expectOk ~= false, expectErr)
+end
+
+local function runSample(ctx, label, spec, expect)
+    runParseCall(ctx, label, function()
+        return parser.parse(ctx, spec)
+    end, expect)
+end
+
+local function runFileSample(ctx, label, path, contents, expect, opts)
+    runParseCall(ctx, label, function()
+        local ok, err = writeFile(path, contents)
+        if not ok then
+            return false, err or "write_failed"
+        end
+        stageArtifact(path)
+        return parser.parseFile(ctx, path, opts)
+    end, expect)
+end
+
+local function runParseTextSample(ctx, label, text, expect)
+    runParseCall(ctx, label, function()
+        return parser.parseText(ctx, text)
+    end, expect)
+end
+
+local function runParseJsonSample(ctx, label, data, expect)
+    runParseCall(ctx, label, function()
+        return parser.parseJson(ctx, data)
+    end, expect)
 end
 
 local function runCustomPath(ctx)
@@ -345,6 +493,26 @@ local function main()
     runSample(ctx, "Sample Text Grid", { text = SAMPLE_TEXT_GRID, format = "grid" }, EXPECT_TEXT_GRID)
     runSample(ctx, "Sample JSON", { text = SAMPLE_JSON, format = "json" }, EXPECT_JSON)
     runSample(ctx, "Sample Voxel", { text = SAMPLE_VOXEL, format = "voxel" }, EXPECT_VOXEL)
+    runParseTextSample(ctx, "Sample Text Grid via parseText", SAMPLE_TEXT_GRID, EXPECT_TEXT_GRID)
+    runParseJsonSample(ctx, "Sample JSON Blocks via parseJson", SAMPLE_BLOCK_DATA, EXPECT_BLOCK_DATA)
+    runParseCall(ctx, "Sample Voxel via data", function()
+        return parser.parse(ctx, { data = SAMPLE_VOXEL_DATA, format = "voxel" })
+    end, EXPECT_VOXEL)
+    runParseCall(ctx, "Sample JSON direct source", function()
+        return parser.parse(ctx, SAMPLE_JSON)
+    end, EXPECT_JSON)
+    for _, sample in ipairs(FILE_SAMPLES) do
+        runFileSample(ctx, sample.label, sample.path, sample.contents, sample.expect, sample.opts)
+    end
+    runParseCall(ctx, "File autodetect via parse", function()
+        local sample = FILE_SAMPLES[1]
+        local ok, err = writeFile(sample.path, sample.contents)
+        if not ok then
+            return false, err or "write_failed"
+        end
+        stageArtifact(sample.path)
+        return parser.parse(ctx, { source = sample.path })
+    end, EXPECT_TEXT_GRID)
 
     if prompt("Run custom file test? (y/n)", "n") == "y" then
         runCustomPath(ctx)
@@ -355,6 +523,7 @@ local function main()
 
     print("\nHarness complete. Review the results above for details.")
     print(string.format("Tests: %d passed / %d total", testStats.passed, testStats.total))
+    cleanupArtifacts()
     if testStats.failures > 0 then
         print("Failures:")
         for _, failure in ipairs(testStats.details) do
