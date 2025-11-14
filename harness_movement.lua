@@ -2,41 +2,22 @@
 -- Run on a CC:Tweaked turtle to exercise movement helpers in-world.
 
 local movement = require("lib_movement")
+local common = require("harness_common")
 
-local function makeLogger(ctx)
-    local logger = {}
-
-    function logger.info(msg)
-        print("[INFO] " .. msg)
-    end
-
-    function logger.warn(msg)
-        print("[WARN] " .. msg)
-    end
-
-    function logger.error(msg)
-        print("[ERROR] " .. msg)
-    end
-
-    function logger.debug(msg)
-        if ctx.config and ctx.config.verbose then
-            print("[DEBUG] " .. msg)
-        end
-    end
-
-    return logger
-end
-
-local function prompt(message)
-    print(message)
-    if _G.read then
-        read()
-    else
-        if _G.sleep then
-            sleep(3)
-        end
-    end
-end
+local DEFAULT_CONTEXT = {
+    origin = { x = 0, y = 0, z = 0 },
+    pointer = { x = 0, y = 0, z = 0 },
+    config = {
+        maxMoveRetries = 12,
+        movementAxisOrder = { "x", "z", "y" },
+        initialFacing = "north",
+        homeFacing = "north",
+        digOnMove = true,
+        attackOnMove = true,
+        moveRetryDelay = 0.4,
+        verbose = true,
+    },
+}
 
 local function describePosition(ctx)
     local pos = movement.getPosition(ctx)
@@ -44,39 +25,27 @@ local function describePosition(ctx)
     return string.format("(x=%d, y=%d, z=%d, facing=%s)", pos.x, pos.y, pos.z, tostring(facing))
 end
 
-local function step(name, fn)
-    print("\n== " .. name .. " ==")
-    local ok, err = fn()
-    if ok then
-        print("Result: PASS")
-    else
-        print("Result: FAIL - " .. tostring(err))
-    end
+local function prompt(io, message)
+    return common.promptEnter(io, message)
 end
 
-local function main()
-    local ctx = {
-        origin = { x = 0, y = 0, z = 0 },
-        pointer = { x = 0, y = 0, z = 0 },
-        config = {
-            maxMoveRetries = 12,
-            movementAxisOrder = { "x", "z", "y" },
-            initialFacing = "north",
-            homeFacing = "north",
-            digOnMove = true,
-            attackOnMove = true,
-            moveRetryDelay = 0.4,
-            verbose = true,
-        },
-    }
-
-    ctx.logger = makeLogger(ctx)
+local function run(ctxOverrides, ioOverrides)
+    local io = common.resolveIo(ioOverrides)
+    local ctx = common.merge(DEFAULT_CONTEXT, ctxOverrides or {})
+    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
 
     movement.ensureState(ctx)
 
-    print("Movement harness starting.\n")
-    print("Before running, ensure the turtle is in an open area with at least a 3x3 clearing and fuel available.")
-    print("The harness assumes the turtle starts at origin (0,0,0) facing north relative to your coordinate system.")
+    local suite = common.createSuite({ name = "Movement Harness", io = io })
+    local function step(name, fn)
+        return suite:step(name, fn)
+    end
+
+    if io.print then
+        io.print("Movement harness starting.\n")
+        io.print("Before running, ensure the turtle is in an open area with at least a 3x3 clearing and fuel available.")
+        io.print("The harness assumes the turtle starts at origin (0,0,0) facing north relative to your coordinate system.")
+    end
 
     step("Orientation exercises", function()
         local ok, err = movement.faceDirection(ctx, "north")
@@ -103,7 +72,9 @@ local function main()
         if not ok then
             return false, err
         end
-        print("Orientation complete: " .. describePosition(ctx))
+        if io.print then
+            io.print("Orientation complete: " .. describePosition(ctx))
+        end
         return true
     end)
 
@@ -111,8 +82,7 @@ local function main()
         if not turtle then
             return false, "turtle API unavailable"
         end
-        prompt("Place a disposable block in front of the turtle, then press Enter.")
-        local digAttempted = false
+        prompt(io, "Place a disposable block in front of the turtle, then press Enter.")
         if not turtle.detect() then
             turtle.place()
         end
@@ -120,12 +90,16 @@ local function main()
         if not ok then
             return false, err
         end
-        print("Moved forward to: " .. describePosition(ctx))
+        if io.print then
+            io.print("Moved forward to: " .. describePosition(ctx))
+        end
         ok, err = movement.returnToOrigin(ctx, {})
         if not ok then
             return false, err
         end
-        print("Returned to origin: " .. describePosition(ctx))
+        if io.print then
+            io.print("Returned to origin: " .. describePosition(ctx))
+        end
         return true
     end)
 
@@ -138,7 +112,9 @@ local function main()
         if not ok then
             return false, err
         end
-        print("Vertical traversal successful: " .. describePosition(ctx))
+        if io.print then
+            io.print("Vertical traversal successful: " .. describePosition(ctx))
+        end
         return true
     end)
 
@@ -153,12 +129,16 @@ local function main()
         if not ok then
             return false, err
         end
-        print("Path completed, position: " .. describePosition(ctx))
+        if io.print then
+            io.print("Path completed, position: " .. describePosition(ctx))
+        end
         ok, err = movement.returnToOrigin(ctx, {})
         if not ok then
             return false, err
         end
-        print("Returned to origin: " .. describePosition(ctx))
+        if io.print then
+            io.print("Returned to origin: " .. describePosition(ctx))
+        end
         return true
     end)
 
@@ -171,11 +151,21 @@ local function main()
         if not ok then
             return false, err
         end
-        print("Final pose: " .. describePosition(ctx))
+        if io.print then
+            io.print("Final pose: " .. describePosition(ctx))
+        end
         return true
     end)
 
-    print("\nHarness complete. Review the results above for any failures.")
+    suite:summary()
+    return suite
 end
 
-main()
+local M = { run = run }
+
+local args = { ... }
+if #args == 0 then
+    run()
+end
+
+return M

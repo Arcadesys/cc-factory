@@ -2,33 +2,29 @@
 -- Run on a CC:Tweaked computer or turtle to exercise logging capabilities.
 
 local loggerLib = require("lib_logger")
+local common = require("harness_common")
 
-local function step(name, fn)
-    print("\n== " .. name .. " ==")
-    local ok, err = fn()
-    if ok then
-        print("Result: PASS")
-    else
-        print("Result: FAIL - " .. tostring(err))
-    end
-end
-
-local function showHistory(entries)
-    if not entries or #entries == 0 then
-        print("Captured history: <empty>")
+local function showHistory(io, entries)
+    if not io.print then
         return
     end
-    print("Captured history:")
+    if not entries or #entries == 0 then
+        io.print("Captured history: <empty>")
+        return
+    end
+    io.print("Captured history:")
     for _, entry in ipairs(entries) do
         local label = entry.levelLabel or entry.level
         local stamp = entry.timestamp and (entry.timestamp .. " ") or ""
         local tag = entry.tag and (entry.tag .. " ") or ""
-        print(string.format(" - %s%s%s%s", stamp, tag, label, entry.message and (" " .. entry.message) or ""))
+        io.print(string.format(" - %s%s%s%s", stamp, tag, label, entry.message and (" " .. entry.message) or ""))
     end
 end
 
-local function main()
-    local ctx = {}
+local function run(ctxOverrides, ioOverrides)
+    local io = common.resolveIo(ioOverrides)
+    local ctx = ctxOverrides or {}
+
     local log = loggerLib.attach(ctx, {
         tag = "HARNESS",
         timestamps = true,
@@ -36,8 +32,15 @@ local function main()
         captureLimit = 32,
     })
 
-    print("Logger harness starting.")
-    print("This script demonstrates leveled output, capture buffers, and writer management.")
+    if io.print then
+        io.print("Logger harness starting.")
+        io.print("This script demonstrates leveled output, capture buffers, and writer management.")
+    end
+
+    local suite = common.createSuite({ name = "Logger Harness", io = io })
+    local step = function(name, fn)
+        return suite:step(name, fn)
+    end
 
     step("Baseline output", function()
         log:info("Logger initialized")
@@ -76,7 +79,7 @@ local function main()
         if not history or #history ~= 2 then
             return false, "unexpected history length"
         end
-        showHistory(history)
+        showHistory(io, history)
         return true
     end)
 
@@ -94,11 +97,21 @@ local function main()
         if #buffer == 0 then
             return false, "custom writer did not capture entry"
         end
-        print("Custom sink stored: " .. table.concat(buffer, ", "))
+        if io.print then
+            io.print("Custom sink stored: " .. table.concat(buffer, ", "))
+        end
         return true
     end)
 
-    print("\nHarness complete. Review the results above for any failures.")
+    suite:summary()
+    return suite
 end
 
-main()
+local M = { run = run }
+
+local args = { ... }
+if #args == 0 then
+    run()
+end
+
+return M

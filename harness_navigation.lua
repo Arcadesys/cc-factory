@@ -5,30 +5,25 @@
 
 local movement = require("lib_movement")
 local navigation = require("lib_navigation")
+local common = require("harness_common")
 
-local function makeLogger(ctx)
-    local logger = {}
-
-    function logger.info(msg)
-        print("[INFO] " .. msg)
-    end
-
-    function logger.warn(msg)
-        print("[WARN] " .. msg)
-    end
-
-    function logger.error(msg)
-        print("[ERROR] " .. msg)
-    end
-
-    function logger.debug(msg)
-        if ctx.config and ctx.config.verbose then
-            print("[DEBUG] " .. msg)
-        end
-    end
-
-    return logger
-end
+local DEFAULT_CONTEXT = {
+    origin = { x = 0, y = 0, z = 0 },
+    pointer = { x = 0, y = 0, z = 0 },
+    config = {
+        verbose = true,
+        initialFacing = "north",
+        homeFacing = "north",
+        moveRetryDelay = 0.4,
+        maxMoveRetries = 12,
+        navigation = {
+            waypoints = {
+                origin = { 0, 0, 0 },
+            },
+            returnAxisOrder = { "z", "x", "y" },
+        },
+    },
+}
 
 local function checkTurtle()
     if not turtle then
@@ -55,7 +50,6 @@ local function seedRandom()
         seed = math.random(0, 10000) + math.random()
     end
     math.randomseed(seed)
-    -- Warm up RNG to avoid low-order correlations.
     for _ = 1, 5 do
         math.random()
     end
@@ -73,65 +67,58 @@ local function describePose(ctx)
     return string.format("(x=%d, y=%d, z=%d, facing=%s)", pos.x, pos.y, pos.z, tostring(facing))
 end
 
-local ctx
-
-local function wander(ctx, steps)
-    print("\n== Wander Phase ==")
-    for step = 1, steps do
+local function wander(ctx, io, steps)
+    if io.print then
+        io.print("-- Wander Phase --")
+    end
+    for stepIndex = 1, steps do
         local facing = randomFacing()
         local ok, err = movement.faceDirection(ctx, facing)
         if not ok then
-            return false, string.format("step %d: %s", step, err or "face failed")
+            return false, string.format("step %d: %s", stepIndex, err or "face failed")
         end
         ok, err = movement.forward(ctx, { dig = true, attack = true })
         if not ok then
-            return false, string.format("step %d: %s", step, err or "move failed")
+            return false, string.format("step %d: %s", stepIndex, err or "move failed")
         end
-        print(string.format("Wander step %d complete; pose %s", step, describePose(ctx)))
+        if io.print then
+            io.print(string.format("Wander step %d complete; pose %s", stepIndex, describePose(ctx)))
+        end
     end
     return true
 end
 
-local function returnHome(ctx)
-    print("\n== Return Phase ==")
+local function returnHome(ctx, io)
+    if io.print then
+        io.print("-- Return Phase --")
+    end
     local moveOpts = {
         dig = false,
         attack = false,
         axisOrder = ctx.config.navigation and ctx.config.navigation.returnAxisOrder or { "z", "x", "y" },
     }
-    local ok, err = navigation.travel(ctx, ctx.origin, { move = moveOpts, finalFacing = ctx.config.homeFacing or ctx.config.initialFacing or "north" })
+    local ok, err = navigation.travel(ctx, ctx.origin, {
+        move = moveOpts,
+        finalFacing = ctx.config.homeFacing or ctx.config.initialFacing or "north",
+    })
     if not ok then
         return false, err
     end
-    print("Returned to origin; pose " .. describePose(ctx))
+    if io.print then
+        io.print("Returned to origin; pose " .. describePose(ctx))
+    end
     return true
 end
 
-local function main()
-    ctx = {
-        origin = { x = 0, y = 0, z = 0 },
-        pointer = { x = 0, y = 0, z = 0 },
-        config = {
-            verbose = true,
-            initialFacing = "north",
-            homeFacing = "north",
-            moveRetryDelay = 0.4,
-            maxMoveRetries = 12,
-            navigation = {
-                waypoints = {
-                    origin = { 0, 0, 0 },
-                },
-                returnAxisOrder = { "z", "x", "y" },
-            },
-        },
-    }
-
-    ctx.logger = makeLogger(ctx)
-
+local function run(ctxOverrides, ioOverrides)
     local ok, err = checkTurtle()
     if not ok then
         error("Navigation harness cannot start: " .. tostring(err))
     end
+
+    local io = common.resolveIo(ioOverrides)
+    local ctx = common.merge(DEFAULT_CONTEXT, ctxOverrides or {})
+    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
 
     seedRandom()
 
@@ -140,21 +127,32 @@ local function main()
     movement.setFacing(ctx, ctx.config.initialFacing)
     navigation.ensureState(ctx)
 
-    print("Navigation harness starting. Ensure a clear area and sufficient fuel.")
-
-    ok, err = wander(ctx, 5)
-    if not ok then
-        print("Result: FAIL - " .. tostring(err))
-        return
+    if io.print then
+        io.print("Navigation harness starting. Ensure a clear area and sufficient fuel.")
     end
 
-    ok, err = returnHome(ctx)
-    if not ok then
-        print("Result: FAIL - " .. tostring(err))
-        return
+    local suite = common.createSuite({ name = "Navigation Harness", io = io })
+    local step = function(name, fn)
+        return suite:step(name, fn)
     end
 
-    print("\nHarness complete. Turtle should be back at origin with no blocks disturbed on the return path.")
+    step("Wander and explore", function()
+        return wander(ctx, io, 5)
+    end)
+
+    step("Return to origin", function()
+        return returnHome(ctx, io)
+    end)
+
+    suite:summary()
+    return suite
 end
 
-main()
+local M = { run = run }
+
+local args = { ... }
+if #args == 0 then
+    run()
+end
+
+return M

@@ -5,58 +5,13 @@ Run on a CC:Tweaked turtle to validate scanning, pulling, pushing, and slot mana
 
 ---@diagnostic disable: undefined-global, undefined-field
 local inventory = require("lib_inventory")
+local common = require("harness_common")
 
-local function makeLogger(ctx)
-    local logger = {}
-
-    function logger.info(msg)
-        print("[INFO] " .. msg)
-    end
-
-    function logger.warn(msg)
-        print("[WARN] " .. msg)
-    end
-
-    function logger.error(msg)
-        print("[ERROR] " .. msg)
-    end
-
-    function logger.debug(msg)
-        if ctx.config and ctx.config.verbose then
-            print("[DEBUG] " .. msg)
-        end
-    end
-
-    return logger
-end
-
-local function promptEnter(message)
-    print(message)
-    if _G.read then
-        read()
-    elseif _G.sleep then
-        sleep(3)
-    end
-end
-
-local function promptInput(message, default)
-    local suffix = ""
-    if default and default ~= "" then
-        suffix = " [" .. default .. "]"
-    end
-    print(message .. suffix)
-    if _G.read then
-        local line = read()
-        if line and line ~= "" then
-            return line
-        end
-    else
-        if _G.sleep then
-            sleep(1)
-        end
-    end
-    return default or ""
-end
+local DEFAULT_CONTEXT = {
+    config = {
+        verbose = true,
+    },
+}
 
 local function getInspect(side)
     if side == "forward" then
@@ -106,7 +61,7 @@ local function detectContainers()
     return found
 end
 
-local function ensureContainer(side)
+local function ensureContainer(io, side)
     while true do
         local inspect = getInspect(side)
         if type(inspect) ~= "function" then
@@ -114,26 +69,39 @@ local function ensureContainer(side)
         end
         local ok, detail = inspect()
         if ok and isContainer(detail) then
-            print(string.format("Detected %s on %s", detail.name or "container", side))
+            if io.print then
+                io.print(string.format("Detected %s on %s", detail.name or "container", side))
+            end
             return true
         end
-        promptEnter(string.format("No chest detected %s. Place a chest there and press Enter.", side == "forward" and "in front" or (side == "up" and "above" or "below")))
+        local location
+        if side == "forward" then
+            location = "in front"
+        elseif side == "up" then
+            location = "above"
+        else
+            location = "below"
+        end
+        common.promptEnter(io, string.format("No chest detected %s. Place a chest there and press Enter.", location))
     end
 end
 
-local function describeTotals(totals)
+local function describeTotals(io, totals)
+    totals = totals or {}
     local keys = {}
     for material in pairs(totals) do
         keys[#keys + 1] = material
     end
     table.sort(keys)
-    if #keys == 0 then
-        print("Inventory totals: <empty>")
-        return
-    end
-    print("Inventory totals:")
-    for _, material in ipairs(keys) do
-        print(string.format(" - %s x%d", material, totals[material] or 0))
+    if io.print then
+        if #keys == 0 then
+            io.print("Inventory totals: <empty>")
+        else
+            io.print("Inventory totals:")
+            for _, material in ipairs(keys) do
+                io.print(string.format(" - %s x%d", material, totals[material] or 0))
+            end
+        end
     end
 end
 
@@ -148,35 +116,29 @@ local function firstMaterial(ctx)
     return nil
 end
 
-local function step(name, fn)
-    print("\n== " .. name .. " ==")
-    local ok, err = fn()
-    if ok then
-        print("Result: PASS")
-    else
-        print("Result: FAIL - " .. tostring(err))
-    end
-end
-
-local function main()
+local function run(ctxOverrides, ioOverrides)
     if not turtle then
         error("turtle API unavailable. Run this on a CC:Tweaked turtle.")
     end
 
-    local ctx = {
-        config = {
-            verbose = true,
-        },
-    }
-    ctx.logger = makeLogger(ctx)
+    local io = common.resolveIo(ioOverrides)
+    local ctx = common.merge(DEFAULT_CONTEXT, ctxOverrides or {})
+    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
     inventory.ensureState(ctx)
 
-    print("Inventory harness starting.")
-    print("Setup: place a supply chest in front of the turtle. Optionally place an output chest below or above.")
+    if io.print then
+        io.print("Inventory harness starting.")
+        io.print("Setup: place a supply chest in front of the turtle. Optionally place an output chest below or above.")
+    end
+
+    local suite = common.createSuite({ name = "Inventory Harness", io = io })
+    local step = function(name, fn)
+        return suite:step(name, fn)
+    end
 
     local containers = detectContainers()
     if #containers == 0 then
-        promptEnter("No chests detected. Place at least one chest (front/up/down) and press Enter.")
+        common.promptEnter(io, "No chests detected. Place at least one chest (front/up/down) and press Enter.")
         containers = detectContainers()
     end
 
@@ -201,8 +163,8 @@ local function main()
         dropSide = supplySide
     end
 
-    ensureContainer(supplySide)
-    ensureContainer(dropSide)
+    ensureContainer(io, supplySide)
+    ensureContainer(io, dropSide)
 
     step("Initial scan", function()
         local ok, err = inventory.scan(ctx, { force = true })
@@ -210,9 +172,9 @@ local function main()
             return false, err
         end
         local totals = inventory.getTotals(ctx)
-        describeTotals(totals or {})
-        if inventory.isEmpty(ctx) then
-            print("Inventory is empty. Pull step will fetch items from chest.")
+        describeTotals(io, totals or {})
+        if inventory.isEmpty(ctx) and io.print then
+            io.print("Inventory is empty. Pull step will fetch items from chest.")
         end
         return true
     end)
@@ -220,19 +182,21 @@ local function main()
     local pulledMaterial
 
     step("Pull items from chest", function()
-        local amountStr = promptInput("Enter amount to pull", "4")
+        local amountStr = common.promptInput(io, "Enter amount to pull", "4")
         local amount = tonumber(amountStr) or 4
         local ok, err = inventory.pullMaterial(ctx, nil, amount, { side = supplySide })
         if not ok then
             return false, err
         end
         local totals = inventory.getTotals(ctx, { force = true })
-        describeTotals(totals or {})
+        describeTotals(io, totals or {})
         pulledMaterial = pulledMaterial or firstMaterial(ctx)
         if not pulledMaterial then
             return false, "nothing pulled"
         end
-        print("Primary material detected: " .. pulledMaterial)
+        if io.print then
+            io.print("Primary material detected: " .. pulledMaterial)
+        end
         return true
     end)
 
@@ -244,7 +208,9 @@ local function main()
         if not ok then
             return false, err
         end
-        print("Selected slot: " .. tostring(turtle.getSelectedSlot and turtle.getSelectedSlot() or "?"))
+        if io.print then
+            io.print("Selected slot: " .. tostring(turtle.getSelectedSlot and turtle.getSelectedSlot() or "?"))
+        end
         return true
     end)
 
@@ -256,7 +222,9 @@ local function main()
         if err then
             return false, err
         end
-        print(string.format("Material %s count: %d", pulledMaterial, count))
+        if io.print then
+            io.print(string.format("Material %s count: %d", pulledMaterial, count))
+        end
         if count <= 0 then
             return false, "count did not increase"
         end
@@ -267,14 +235,14 @@ local function main()
         if not pulledMaterial then
             return false, "no material available"
         end
-        local dropAmountStr = promptInput("Enter amount to push", "2")
+        local dropAmountStr = common.promptInput(io, "Enter amount to push", "2")
         local dropAmount = tonumber(dropAmountStr) or 2
         local ok, err = inventory.pushMaterial(ctx, pulledMaterial, dropAmount, { side = dropSide })
         if not ok then
             return false, err
         end
         local totals = inventory.getTotals(ctx, { force = true })
-        describeTotals(totals or {})
+        describeTotals(io, totals or {})
         return true
     end)
 
@@ -292,7 +260,7 @@ local function main()
             return false, err
         end
         local totals = inventory.getTotals(ctx, { force = true })
-        describeTotals(totals or {})
+        describeTotals(io, totals or {})
         return true
     end)
 
@@ -301,11 +269,21 @@ local function main()
         if not snap then
             return false, err
         end
-        print(string.format("Snapshot version %d with %d total items", snap.scanVersion or 0, snap.totalItems or 0))
+        if io.print then
+            io.print(string.format("Snapshot version %d with %d total items", snap.scanVersion or 0, snap.totalItems or 0))
+        end
         return true
     end)
 
-    print("\nHarness complete. Review the results above for any failures.")
+    suite:summary()
+    return suite
 end
 
-main()
+local M = { run = run }
+
+local args = { ... }
+if #args == 0 then
+    run()
+end
+
+return M
