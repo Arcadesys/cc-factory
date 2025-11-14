@@ -288,19 +288,37 @@ local function detectBlock(sideFns)
 end
 
 local function clearBlockingBlock(sideFns, allowDig, allowAttack)
-    local cleared = false
-    if allowDig and type(sideFns.dig) == "function" then
-        cleared = sideFns.dig()
+    if not allowDig and not allowAttack then
+        return false
     end
-    if not cleared and allowAttack and type(sideFns.attack) == "function" then
-        cleared = sideFns.attack()
-    end
-    if cleared and type(sideFns.detect) == "function" then
-        if sideFns.detect() then
-            return false
+
+    local attempts = 0
+    local maxAttempts = 4
+
+    while attempts < maxAttempts do
+        attempts = attempts + 1
+        local cleared = false
+
+        if allowDig and type(sideFns.dig) == "function" then
+            cleared = sideFns.dig() or cleared
+        end
+
+        if not cleared and allowAttack and type(sideFns.attack) == "function" then
+            cleared = sideFns.attack() or cleared
+        end
+
+        if cleared then
+            if type(sideFns.detect) ~= "function" or not sideFns.detect() then
+                return true
+            end
+        end
+
+        if sleep and attempts < maxAttempts then
+            sleep(0)
         end
     end
-    return cleared
+
+    return false
 end
 
 function placement.placeMaterial(ctx, material, opts)
@@ -336,9 +354,10 @@ function placement.placeMaterial(ctx, material, opts)
     local allowOverwrite = resolveOverwrite(ctx, opts and opts.block or nil, opts)
 
     local blockPresent, blockData = detectBlock(sideFns)
+    local blockingName = blockData and blockData.name or nil
     if blockPresent then
         if blockData and blockData.name == material then
-            state.lastPlacement = { success = true, material = material, reused = true, side = side }
+            state.lastPlacement = { success = true, material = material, reused = true, side = side, blocking = blockingName }
             return true, "already_present"
         end
 
@@ -346,14 +365,14 @@ function placement.placeMaterial(ctx, material, opts)
         local canForce = allowOverwrite or needsReplacement
 
         if not canForce then
-            state.lastPlacement = { success = false, material = material, error = "occupied", side = side }
+            state.lastPlacement = { success = false, material = material, error = "occupied", side = side, blocking = blockingName }
             return false, "occupied"
         end
 
         local cleared = clearBlockingBlock(sideFns, allowDig, allowAttack)
         if not cleared then
             local reason = needsReplacement and "mismatched_block" or "blocked"
-            state.lastPlacement = { success = false, material = material, error = reason, side = side }
+            state.lastPlacement = { success = false, material = material, error = reason, side = side, blocking = blockingName }
             return false, reason
         end
     end

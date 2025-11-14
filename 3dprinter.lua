@@ -708,6 +708,46 @@ local function buildOrder(schema, info, opts)
     return order, bounds
 end
 
+local function registerPlannedBlock(plan, pos, material)
+    if not material or material == "" then
+        return
+    end
+
+    local x = pos.x or 0
+    local y = pos.y or 0
+    local z = pos.z or 0
+
+    plan[x] = plan[x] or {}
+    local xLayer = plan[x]
+    xLayer[y] = xLayer[y] or {}
+    xLayer[y][z] = material
+end
+
+local function prepareBuildPlan(ctx, order, opts)
+    if type(ctx) ~= "table" or type(order) ~= "table" then
+        return
+    end
+
+    opts = opts or {}
+    local plan = {}
+    local origin = ctx.origin or { x = 0, y = 0, z = 0 }
+
+    for _, step in ipairs(order) do
+        local block = step.block
+        if isPlaceable(block) and step.localPos then
+            local worldOffset = localToWorld(step.localPos, opts.facing)
+            local pos = {
+                x = (origin.x or 0) + (worldOffset.x or 0),
+                y = (origin.y or 0) + (worldOffset.y or 0),
+                z = (origin.z or 0) + (worldOffset.z or 0),
+            }
+            registerPlannedBlock(plan, pos, block.material)
+        end
+    end
+
+    ctx.buildPlan = plan
+end
+
 local function travelTo(ctx, target, travelClearance)
     -- Move via an elevated waypoint to minimise collisions with the freshly printed build.
     local current = movement.getPosition(ctx)
@@ -804,6 +844,72 @@ local function returnToOrigin(ctx, opts, bounds, logger)
     return true
 end
 
+local restockMaterial
+
+local function attemptAutoRestock(ctx, opts, bounds, step, logger)
+    if not ctx or (opts and opts.dryRun) then
+        return false
+    end
+    if not ctx.hasSupplyChest then
+        return false
+    end
+    if not step or not step.block or not step.block.material then
+        return false
+    end
+
+    local material = step.block.material
+
+    local homeOk, homeErr = returnToOrigin(ctx, opts, bounds, logger)
+    if not homeOk then
+        if logger and logger.warn then
+            logger:warn(string.format("Unable to reach supply chest for %s: %s", material, tostring(homeErr)))
+        end
+        return false
+    end
+
+    inventory.invalidate(ctx)
+
+    local targets = ctx.materialTargets or {}
+    local target = targets[material] or 64
+
+    local before, beforeErr = inventory.countMaterial(ctx, material, { force = true })
+    if beforeErr then
+        if logger and logger.debug then
+            logger:debug(string.format("Inventory scan failed before restock: %s", tostring(beforeErr)))
+        end
+        before = 0
+    end
+
+    local count, metTarget, restockErr = restockMaterial(ctx, material, target, logger)
+    if restockErr then
+        if logger and logger.debug then
+            logger:debug(string.format("Automatic restock for %s failed: %s", material, tostring(restockErr)))
+        end
+        return count > before
+    end
+
+    if count > before then
+        local gained = count - before
+        if logger then
+            if metTarget and logger.info then
+                logger:info(string.format("Restocked %s (+%d, now %d)", material, gained, count))
+            elseif logger.debug then
+                logger:debug(string.format("Restocked %s (+%d, now %d/%d)", material, gained, count, target))
+            end
+        end
+        return true
+    end
+
+    if count > 0 then
+        return true
+    end
+
+    if logger and logger.warn then
+        logger:warn(string.format("Supply chest is out of %s; awaiting manual refill.", material))
+    end
+    return false
+end
+
 local function awaitMaterialRefill(ctx, opts, bounds, step, logger)
     if not step or not step.block or not step.block.material then
         return false
@@ -869,10 +975,85 @@ local function awaitMaterialRefill(ctx, opts, bounds, step, logger)
     end
 end
 
+local function awaitObstacleClear(ctx, opts, step, reason, logger)
+    if type(read) ~= "function" then
+        if logger then
+            logger:error("Placement blocked and no input available; aborting print.")
+        end
+        return false
+    end
+
+    local blockingName
+    if ctx and ctx.placement and ctx.placement.lastPlacement then
+        blockingName = ctx.placement.lastPlacement.blocking
+    end
+
+    local pos = step and step.localPos or nil
+    local posText = pos and string.format("(%d,%d,%d)", pos.x or 0, pos.y or 0, pos.z or 0) or "unknown"
+    local material = step and step.block and step.block.material or "unknown"
+
+    print("")
+    print(string.format("Placement blocked at local %s while placing %s.", posText, material))
+    if blockingName then
+        print(string.format("Detected blocking block: %s", blockingName))
+    end
+    if reason == "mismatched_block" then
+        print("Clear the conflicting block, then press Enter to retry. Type 'cancel' to abort.")
+    else
+        print("Resolve the obstruction, then press Enter to retry. Type 'cancel' to abort.")
+    end
+
+    while true do
+        if type(write) == "function" then
+            write("> ")
+        else
+            print("> ")
+        end
+        local response = read()
+        local trimmed = response and response:gsub("^%s+", ""):gsub("%s+$", "") or ""
+
+        if trimmed == "" or trimmed:lower() == "retry" or trimmed:lower() == "continue" then
+            return true
+        end
+
+        local lower = trimmed:lower()
+        if lower == "cancel" or lower == "abort" or lower == "stop" or lower == "quit" or lower == "exit" then
+            if logger then
+                logger:warn("Print aborted by user after blockage notification.")
+            end
+            return false
+        end
+
+        print("Press Enter to retry once the path is clear, or type 'cancel' to abort.")
+    end
+end
+
 local function handlePlacementFailure(ctx, opts, bounds, step, reason, logger)
     reason = reason or "unknown"
     if reason == "missing_material" then
+        if attemptAutoRestock(ctx, opts, bounds, step, logger) then
+            return "retry"
+        end
         local resumed = awaitMaterialRefill(ctx, opts, bounds, step, logger)
+        if resumed then
+            return "retry"
+        end
+        return "abort"
+    end
+
+    if reason == "mismatched_block" or reason == "blocked" then
+        local blockingName
+        if ctx and ctx.placement and ctx.placement.lastPlacement then
+            blockingName = ctx.placement.lastPlacement.blocking
+        end
+        if logger then
+            if step and step.localPos then
+                logger:warn(string.format("Placement blocked at local (%d,%d,%d) by %s; awaiting manual clear.", step.localPos.x or 0, step.localPos.y or 0, step.localPos.z or 0, blockingName or "unknown block"))
+            else
+                logger:warn(string.format("Placement blocked by %s; awaiting manual clear.", blockingName or "unknown block"))
+            end
+        end
+        local resumed = awaitObstacleClear(ctx, opts, step, reason, logger)
         if resumed then
             return "retry"
         end
@@ -1041,6 +1222,118 @@ local function logMaterialAvailability(logger, report, verbose)
     end
 end
 
+local function hasSupplyAccess(report)
+    if type(report) ~= "table" then
+        return false
+    end
+    if type(report.chests) ~= "table" then
+        return false
+    end
+    for _, entry in ipairs(report.chests) do
+        if type(entry) == "table" and not entry.error then
+            return true
+        end
+    end
+    return false
+end
+
+local function computeTargetStacks(report)
+    local targets = {}
+    local manifest = report and report.manifest
+    if type(manifest) ~= "table" then
+        return targets
+    end
+    for material, _ in pairs(manifest) do
+        if type(material) == "string" and material ~= "minecraft:air" and material ~= "air" then
+            targets[material] = 64
+        end
+    end
+    return targets
+end
+
+function restockMaterial(ctx, material, target, logger)
+    target = (target and target > 0) and target or 64
+    local attempts = 0
+    local lastCount = -1
+    while attempts < 4 do
+        local count, countErr = inventory.countMaterial(ctx, material, { force = true })
+        if countErr then
+            return 0, false, countErr
+        end
+        if count >= target then
+            return count, true, nil
+        end
+        if count <= lastCount then
+            break
+        end
+        lastCount = count
+        local request = math.max(target - count, 1)
+        local ok, pullErr = inventory.pullMaterial(ctx, material, request, { side = "forward" })
+        if not ok then
+            return count, false, pullErr
+        end
+        inventory.invalidate(ctx)
+        attempts = attempts + 1
+    end
+
+    local finalCount, finalErr = inventory.countMaterial(ctx, material, { force = true })
+    if finalErr then
+        return 0, false, finalErr
+    end
+    return finalCount, finalCount >= target, nil
+end
+
+local function primeManifestInventory(ctx, logger)
+    if not ctx.materialReport then
+        return
+    end
+
+    ctx.materialTargets = computeTargetStacks(ctx.materialReport)
+    ctx.hasSupplyChest = hasSupplyAccess(ctx.materialReport)
+
+    local targets = ctx.materialTargets
+    if not ctx.hasSupplyChest or not targets or next(targets) == nil then
+        if logger and logger.debug then
+            logger:debug("Supply chests unavailable; skipping manifest priming.")
+        end
+        return
+    end
+
+    inventory.invalidate(ctx)
+
+    local materials = {}
+    for material in pairs(targets) do
+        materials[#materials + 1] = material
+    end
+    table.sort(materials)
+
+    for _, material in ipairs(materials) do
+        local target = targets[material]
+        local before, beforeErr = inventory.countMaterial(ctx, material, { force = true })
+        if beforeErr then
+            if logger and logger.debug then
+                logger:debug(string.format("Unable to read inventory for %s: %s", material, tostring(beforeErr)))
+            end
+        elseif before < target then
+            local count, metTarget, restockErr = restockMaterial(ctx, material, target, logger)
+            if restockErr then
+                if logger and logger.debug then
+                    logger:debug(string.format("Priming %s failed: %s", material, tostring(restockErr)))
+                end
+            else
+                local gained = count - before
+                if gained > 0 then
+                    if logger and logger.info then
+                        logger:info(string.format("Primed %s (+%d, now %d)", material, gained, count))
+                    end
+                elseif not metTarget and logger and logger.warn then
+                    logger:warn(string.format("Supply chest lacks enough %s; have %d", material, count))
+                end
+            end
+        end
+    end
+end
+
 local function run(rawArgs)
     local opts = parseArgs(rawArgs)
     if opts.showHelp then
@@ -1155,6 +1448,13 @@ local function run(rawArgs)
         return
     end
 
+    if opts.dryRun then
+        ctx.materialTargets = computeTargetStacks(ctx.materialReport)
+        ctx.hasSupplyChest = hasSupplyAccess(ctx.materialReport)
+    else
+        primeManifestInventory(ctx, logger)
+    end
+
     local order, boundsOrErr = buildOrder(schema, info, opts)
     if not order then
         logger:error("Unable to derive build order: " .. tostring(boundsOrErr))
@@ -1168,6 +1468,7 @@ local function run(rawArgs)
     end
 
     logger:info(string.format("Planned %d placements across %d layers.", #order, (bounds.maxY - bounds.minY) + 1))
+    prepareBuildPlan(ctx, order, opts)
     if opts.dryRun then
         logger:info("Dry run enabled; skipping movement and placement.")
     end

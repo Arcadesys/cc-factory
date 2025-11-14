@@ -42,6 +42,49 @@ local function vecAdd(a, b)
     return { x = (a.x or 0) + (b.x or 0), y = (a.y or 0) + (b.y or 0), z = (a.z or 0) + (b.z or 0) }
 end
 
+local function getPlannedMaterial(ctx, pos)
+    if type(ctx) ~= "table" or type(pos) ~= "table" then
+        return nil
+    end
+
+    local plan = ctx.buildPlan
+    if type(plan) ~= "table" then
+        return nil
+    end
+
+    local x = pos.x
+    local xLayer = plan[x] or plan[tostring(x)]
+    if type(xLayer) ~= "table" then
+        return nil
+    end
+
+    local y = pos.y
+    local yLayer = xLayer[y] or xLayer[tostring(y)]
+    if type(yLayer) ~= "table" then
+        return nil
+    end
+
+    local z = pos.z
+    return yLayer[z] or yLayer[tostring(z)]
+end
+
+local function tryInspect(inspectFn)
+    if type(inspectFn) ~= "function" then
+        return nil
+    end
+
+    local ok, success, data = pcall(inspectFn)
+    if not ok or not success then
+        return nil
+    end
+
+    if type(data) == "table" then
+        return data
+    end
+
+    return nil
+end
+
 local function log(ctx, level, message)
     if not ctx then
         return
@@ -273,8 +316,10 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
 
     while attempt < maxRetries do
         attempt = attempt + 1
+        local targetPos = vecAdd(state.position, delta)
+
         if moveFns.move() then
-            state.position = vecAdd(state.position, delta)
+            state.position = targetPos
             log(ctx, "debug", string.format("Moved to x=%d y=%d z=%d", state.position.x, state.position.y, state.position.z))
             return true
         end
@@ -289,11 +334,64 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
         end
 
         local blocked = moveFns.detect and moveFns.detect() or false
+        local inspectData
+        if blocked then
+            inspectData = tryInspect(moveFns.inspect)
+        end
 
         if blocked and allowDig and moveFns.dig then
-            if moveFns.dig() then
+            local plannedMaterial = getPlannedMaterial(ctx, targetPos)
+            local canClear = true
+
+            if plannedMaterial then
+                if inspectData and inspectData.name then
+                    if inspectData.name == plannedMaterial then
+                        canClear = false
+                    end
+                else
+                    canClear = false
+                end
+            end
+
+            if canClear and moveFns.dig() then
                 handled = true
-                log(ctx, "debug", "Dug blocking block")
+                if plannedMaterial then
+                    local foundName = inspectData and inspectData.name or "unknown"
+                    log(ctx, "debug", string.format(
+                        "Cleared mismatched block %s (expected %s) at x=%d y=%d z=%d",
+                        tostring(foundName),
+                        tostring(plannedMaterial),
+                        targetPos.x or 0,
+                        targetPos.y or 0,
+                        targetPos.z or 0
+                    ))
+                else
+                    local foundName = inspectData and inspectData.name
+                    if foundName then
+                        log(ctx, "debug", string.format(
+                            "Dug blocking block %s at x=%d y=%d z=%d",
+                            foundName,
+                            targetPos.x or 0,
+                            targetPos.y or 0,
+                            targetPos.z or 0
+                        ))
+                    else
+                        log(ctx, "debug", string.format(
+                            "Dug blocking block at x=%d y=%d z=%d",
+                            targetPos.x or 0,
+                            targetPos.y or 0,
+                            targetPos.z or 0
+                        ))
+                    end
+                end
+            elseif plannedMaterial and not canClear then
+                log(ctx, "debug", string.format(
+                    "Preserving planned block %s at x=%d y=%d z=%d",
+                    tostring(plannedMaterial),
+                    targetPos.x or 0,
+                    targetPos.y or 0,
+                    targetPos.z or 0
+                ))
             end
         end
 
@@ -318,6 +416,7 @@ function movement.forward(ctx, opts)
         detect = turtle and turtle.detect or nil,
         dig = turtle and turtle.dig or nil,
         attack = turtle and turtle.attack or nil,
+        inspect = turtle and turtle.inspect or nil,
     }
 
     if not moveFns.move then
@@ -333,6 +432,7 @@ function movement.up(ctx, opts)
         detect = turtle and turtle.detectUp or nil,
         dig = turtle and turtle.digUp or nil,
         attack = turtle and turtle.attackUp or nil,
+        inspect = turtle and turtle.inspectUp or nil,
     }
     if not moveFns.move then
         return false, "turtle API unavailable"
@@ -346,6 +446,7 @@ function movement.down(ctx, opts)
         detect = turtle and turtle.detectDown or nil,
         dig = turtle and turtle.digDown or nil,
         attack = turtle and turtle.attackDown or nil,
+        inspect = turtle and turtle.inspectDown or nil,
     }
     if not moveFns.move then
         return false, "turtle API unavailable"

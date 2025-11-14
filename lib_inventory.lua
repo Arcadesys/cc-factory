@@ -26,6 +26,28 @@ local SIDE_ACTIONS = {
     },
 }
 
+local PUSH_TARGETS = {
+    "front",
+    "back",
+    "left",
+    "right",
+    "top",
+    "bottom",
+    "north",
+    "south",
+    "east",
+    "west",
+    "up",
+    "down",
+}
+
+local OPPOSITE_FACING = {
+    north = "south",
+    south = "north",
+    east = "west",
+    west = "east",
+}
+
 local function log(ctx, level, message)
     if type(ctx) ~= "table" then
         return
@@ -44,46 +66,81 @@ local function log(ctx, level, message)
     end
 end
 
+local CONTAINER_KEYWORDS = {
+    "chest",
+    "barrel",
+    "drawer",
+    "cabinet",
+    "crate",
+    "locker",
+    "storage",
+    "box",
+    "bin",
+    "cache",
+    "shelf",
+    "cupboard",
+    "depot",
+    "controller",
+    "shulker",
+    "shulkerbox",
+}
+
 local function noop()
-    return
 end
 
-local function copySummary(tbl)
-    local result = {}
-    for k, v in pairs(tbl) do
-        result[k] = v
+local function normalizeSide(value)
+    if type(value) ~= "string" then
+        return nil
     end
-    return result
-end
-
-local function copyArray(source)
-    local result = {}
-    for i = 1, #source do
-        result[i] = source[i]
+    local lower = value:lower()
+    if lower == "forward" or lower == "front" or lower == "fwd" then
+        return "forward"
     end
-    return result
+    if lower == "up" or lower == "top" or lower == "above" then
+        return "up"
+    end
+    if lower == "down" or lower == "bottom" or lower == "below" then
+        return "down"
+    end
+    return nil
 end
 
-local function copySlots(slots)
-    local result = {}
-    for index, info in pairs(slots) do
-        if type(info) == "table" then
-            local detailCopy
-            if type(info.detail) == "table" then
-                detailCopy = copySummary(info.detail)
-            end
-            result[index] = {
-                slot = info.slot,
-                count = info.count,
-                name = info.name,
-                detail = detailCopy,
-            }
+local function resolveSide(ctx, opts)
+    if type(opts) == "string" then
+        local direct = normalizeSide(opts)
+        return direct or "forward"
+    end
+
+    local candidate
+    if type(opts) == "table" then
+        candidate = opts.side or opts.direction or opts.facing or opts.containerSide or opts.defaultSide
+        if not candidate and type(opts.location) == "string" then
+            candidate = opts.location
         end
     end
-    return result
+
+    if not candidate and type(ctx) == "table" then
+        local cfg = ctx.config
+        if type(cfg) == "table" then
+            candidate = cfg.inventorySide or cfg.materialSide or cfg.supplySide or cfg.defaultInventorySide
+        end
+        if not candidate and type(ctx.inventoryState) == "table" then
+            candidate = ctx.inventoryState.defaultSide
+        end
+    end
+
+    local normalised = normalizeSide(candidate)
+    if normalised then
+        return normalised
+    end
+
+    return "forward"
 end
 
 local function tableCount(tbl)
+    if type(tbl) ~= "table" then
+        return 0
+    end
     local count = 0
     for _ in pairs(tbl) do
         count = count + 1
@@ -91,28 +148,47 @@ local function tableCount(tbl)
     return count
 end
 
-local function resolveSide(opts)
-    if type(opts) ~= "table" then
-        return "forward"
+local function copyArray(list)
+    if type(list) ~= "table" then
+        return {}
     end
-    local side = opts.side or opts.direction or "forward"
-    if side == "front" then
-        side = "forward"
+    local result = {}
+    for index = 1, #list do
+        result[index] = list[index]
     end
-    if side ~= "forward" and side ~= "up" and side ~= "down" then
-        return "forward"
-    end
-    return side
+    return result
 end
 
-local CONTAINER_KEYWORDS = {
-    "chest",
-    "barrel",
-    "drawer",
-    "crate",
-    "shulker_box",
-    "shulkerbox",
-}
+local function copySummary(summary)
+    if type(summary) ~= "table" then
+        return {}
+    end
+    local result = {}
+    for key, value in pairs(summary) do
+        result[key] = value
+    end
+    return result
+end
+
+local function copySlots(slots)
+    if type(slots) ~= "table" then
+        return {}
+    end
+    local result = {}
+    for slot, info in pairs(slots) do
+        if type(info) == "table" then
+            result[slot] = {
+                slot = info.slot,
+                count = info.count,
+                name = info.name,
+                detail = info.detail,
+            }
+        else
+            result[slot] = info
+        end
+    end
+    return result
+end
 
 local function hasContainerTag(tags)
     if type(tags) ~= "table" then
@@ -163,6 +239,164 @@ local function shouldSearchAllSides(opts)
         return false
     end
     return true
+end
+
+local function peripheralSideForDirection(side)
+    if side == "forward" or side == "front" then
+        return "front"
+    end
+    if side == "up" or side == "top" then
+        return "top"
+    end
+    if side == "down" or side == "bottom" then
+        return "bottom"
+    end
+    return side
+end
+
+local function computePrimaryPushDirection(ctx, periphSide)
+    if periphSide == "front" then
+        local facing = movement.getFacing(ctx)
+        if facing then
+            return OPPOSITE_FACING[facing]
+        end
+    elseif periphSide == "top" then
+        return "down"
+    elseif periphSide == "bottom" then
+        return "up"
+    end
+    return nil
+end
+
+local function tryPushItems(chest, periphSide, slot, amount, targetSlot, primaryDirection)
+    if type(chest) ~= "table" or type(chest.pushItems) ~= "function" then
+        return 0
+    end
+
+    local tried = {}
+
+    local function attempt(direction)
+        if not direction or tried[direction] then
+            return 0
+        end
+        tried[direction] = true
+        local ok, moved
+        if targetSlot then
+            ok, moved = pcall(chest.pushItems, direction, slot, amount, targetSlot)
+        else
+            ok, moved = pcall(chest.pushItems, direction, slot, amount)
+        end
+        if ok and type(moved) == "number" and moved > 0 then
+            return moved
+        end
+        return 0
+    end
+
+    local moved = attempt(primaryDirection)
+    if moved > 0 then
+        return moved
+    end
+
+    for _, direction in ipairs(PUSH_TARGETS) do
+        moved = attempt(direction)
+        if moved > 0 then
+            return moved
+        end
+    end
+
+    return 0
+end
+
+local function collectStacks(chest, material)
+    local stacks = {}
+    if type(chest) ~= "table" or not material then
+        return stacks
+    end
+
+    if type(chest.list) == "function" then
+        local ok, list = pcall(chest.list)
+        if ok and type(list) == "table" then
+            for slot, stack in pairs(list) do
+                local numericSlot = tonumber(slot)
+                if numericSlot and type(stack) == "table" then
+                    local name = stack.name or stack.id
+                    local count = stack.count or stack.qty or stack.quantity or 0
+                    if name == material and type(count) == "number" and count > 0 then
+                        stacks[#stacks + 1] = { slot = numericSlot, count = count }
+                    end
+                end
+            end
+        end
+    end
+
+    if #stacks == 0 and type(chest.size) == "function" and type(chest.getItemDetail) == "function" then
+        local okSize, size = pcall(chest.size)
+        if okSize and type(size) == "number" and size > 0 then
+            for slot = 1, size do
+                local okDetail, detail = pcall(chest.getItemDetail, slot)
+                if okDetail and type(detail) == "table" then
+                    local name = detail.name
+                    local count = detail.count or detail.qty or detail.quantity or 0
+                    if name == material and type(count) == "number" and count > 0 then
+                        stacks[#stacks + 1] = { slot = slot, count = count }
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(stacks, function(a, b)
+        return a.slot < b.slot
+    end)
+
+    return stacks
+end
+
+local function extractFromContainer(ctx, periphSide, material, amount, targetSlot)
+    if not material or not peripheral or type(peripheral.wrap) ~= "function" then
+        return 0
+    end
+
+    local wrapOk, chest = pcall(peripheral.wrap, periphSide)
+    if not wrapOk or type(chest) ~= "table" then
+        return 0
+    end
+    if type(chest.pushItems) ~= "function" then
+        return 0
+    end
+
+    local desired = amount
+    if not desired or desired <= 0 then
+        desired = 64
+    end
+
+    local stacks = collectStacks(chest, material)
+    if #stacks == 0 then
+        return 0
+    end
+
+    local remaining = desired
+    local transferred = 0
+    local primaryDirection = computePrimaryPushDirection(ctx, periphSide)
+
+    for _, stack in ipairs(stacks) do
+        local available = stack.count or 0
+        while remaining > 0 and available > 0 do
+            local toMove = math.min(available, remaining, 64)
+            local moved = tryPushItems(chest, periphSide, stack.slot, toMove, targetSlot, primaryDirection)
+            if moved <= 0 then
+                break
+            end
+            transferred = transferred + moved
+            remaining = remaining - moved
+            available = available - moved
+        end
+        if remaining <= 0 then
+            break
+        end
+    end
+
+    return transferred
 end
 
 local function ensureChestAhead(ctx, opts)
@@ -535,7 +769,7 @@ function inventory.pushSlot(ctx, slot, amount, opts)
     if not turtle then
         return false, "turtle API unavailable"
     end
-    local side = resolveSide(opts)
+    local side = resolveSide(ctx, opts)
     local actions = SIDE_ACTIONS[side]
     if not actions or type(actions.drop) ~= "function" then
         return false, "invalid_side"
@@ -617,7 +851,7 @@ function inventory.pullMaterial(ctx, material, amount, opts)
         return false, err
     end
 
-    local side = resolveSide(opts)
+    local side = resolveSide(ctx, opts)
     local actions = SIDE_ACTIONS[side]
     if not actions or type(actions.suck) ~= "function" then
         return false, "invalid_side"
