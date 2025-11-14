@@ -11,7 +11,27 @@ local inventory = require("lib_inventory")
 
 local initialize = {}
 
-local DEFAULT_SIDES = { "forward", "down", "up" }
+local DEFAULT_SIDES = { "forward", "down", "up", "left", "right", "back" }
+
+local SIDE_ALIASES = {
+    forward = "forward",
+    front = "forward",
+    down = "down",
+    bottom = "down",
+    up = "up",
+    top = "up",
+    left = "left",
+    right = "right",
+    back = "back",
+    behind = "back",
+}
+
+local function normaliseSide(side)
+    if type(side) ~= "string" then
+        return nil
+    end
+    return SIDE_ALIASES[string.lower(side)]
+end
 
 local function log(ctx, level, message)
     if type(ctx) ~= "table" then
@@ -36,25 +56,53 @@ end
 
 local function mapSides(opts)
     local sides = {}
+    local seen = {}
     if type(opts) == "table" and type(opts.sides) == "table" then
         for _, side in ipairs(opts.sides) do
-            sides[#sides + 1] = side
+            local normalised = normaliseSide(side)
+            if normalised and not seen[normalised] then
+                sides[#sides + 1] = normalised
+                seen[normalised] = true
+            end
         end
     end
     if #sides == 0 then
         for _, side in ipairs(DEFAULT_SIDES) do
-            sides[#sides + 1] = side
+            local normalised = normaliseSide(side)
+            if normalised and not seen[normalised] then
+                sides[#sides + 1] = normalised
+                seen[normalised] = true
+            end
         end
     end
     return sides
 end
 
+local function toPeripheralSide(side)
+    local normalised = normaliseSide(side) or side
+    if normalised == "forward" then
+        return "front"
+    elseif normalised == "up" then
+        return "top"
+    elseif normalised == "down" then
+        return "bottom"
+    elseif normalised == "back" then
+        return "back"
+    elseif normalised == "left" then
+        return "left"
+    elseif normalised == "right" then
+        return "right"
+    end
+    return normalised
+end
+
 local function inspectSide(side)
-    if side == "forward" then
+    local normalised = normaliseSide(side)
+    if normalised == "forward" then
         return turtle and turtle.inspect and turtle.inspect()
-    elseif side == "up" then
+    elseif normalised == "up" then
         return turtle and turtle.inspectUp and turtle.inspectUp()
-    elseif side == "down" then
+    elseif normalised == "down" then
         return turtle and turtle.inspectDown and turtle.inspectDown()
     end
     return false
@@ -77,17 +125,6 @@ local function isContainer(detail)
         end
     end
     return false
-end
-
-local function toPeripheralSide(side)
-    if side == "forward" then
-        return "front"
-    elseif side == "up" then
-        return "top"
-    elseif side == "down" then
-        return "bottom"
-    end
-    return side
 end
 
 local function copyTotals(totals)
@@ -172,15 +209,51 @@ local function gatherChestData(ctx, opts)
         return entries, combined
     end
     for _, side in ipairs(mapSides(opts)) do
-        local ok, detail = inspectSide(side)
-        if ok and isContainer(detail) then
-            local periphSide = toPeripheralSide(side)
-            local okWrap, wrapped = pcall(peripheral.wrap, periphSide)
-            local containerName = "container"
-            if type(detail) == "table" and type(detail.name) == "string" and detail.name ~= "" then
-                containerName = detail.name
+        local periphSide = toPeripheralSide(side) or side
+        local inspectOk, inspectDetail = inspectSide(side)
+        local inspectIsContainer = inspectOk and isContainer(inspectDetail)
+        local inspectName = nil
+        if inspectIsContainer and type(inspectDetail) == "table" and type(inspectDetail.name) == "string" and inspectDetail.name ~= "" then
+            inspectName = inspectDetail.name
+        end
+
+        local wrapOk, wrapped = pcall(peripheral.wrap, periphSide)
+        if not wrapOk then
+            wrapped = nil
+        end
+
+        local metaName, metaTags
+        if wrapped then
+            if type(peripheral.call) == "function" then
+                local metaOk, metadata = pcall(peripheral.call, periphSide, "getMetadata")
+                if metaOk and type(metadata) == "table" then
+                    metaName = metadata.name or metadata.displayName or metaName
+                    metaTags = metadata.tags
+                end
             end
-            if okWrap and type(wrapped) == "table" then
+            if not metaName and type(peripheral.getType) == "function" then
+                local typeOk, perType = pcall(peripheral.getType, periphSide)
+                if typeOk then
+                    if type(perType) == "string" then
+                        metaName = perType
+                    elseif type(perType) == "table" and type(perType[1]) == "string" then
+                        metaName = perType[1]
+                    end
+                end
+            end
+        end
+
+        local metaIsContainer = false
+        if metaName then
+            metaIsContainer = isContainer({ name = metaName, tags = metaTags })
+        end
+
+        local hasInventoryMethods = wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function")
+        local containerDetected = inspectIsContainer or metaIsContainer or hasInventoryMethods
+
+        if containerDetected then
+            local containerName = inspectName or metaName or "container"
+            if wrapped and hasInventoryMethods then
                 local totals = listChestTotals(wrapped)
                 mergeTotals(combined, totals)
                 entries[#entries + 1] = {

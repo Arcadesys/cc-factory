@@ -140,12 +140,171 @@ local function promptStartCell(opts, logger)
     end
 end
 
+local function detectFacingWithGps(logger)
+    if not gps or type(gps.locate) ~= "function" then
+        return nil, "gps_unavailable"
+    end
+    if not turtle or type(turtle.forward) ~= "function" or type(turtle.back) ~= "function" then
+        return nil, "turtle_api_unavailable"
+    end
+
+    local function locate(timeout)
+        local ok, x, y, z = pcall(gps.locate, timeout)
+        if ok and x then
+            return x, y, z
+        end
+        return nil, nil, nil
+    end
+
+    local x1, _, z1 = locate(0.5)
+    if not x1 then
+        x1, _, z1 = locate(1)
+        if not x1 then
+            return nil, "gps_initial_failed"
+        end
+    end
+
+    if not turtle.forward() then
+        return nil, "forward_blocked"
+    end
+
+    local x2, _, z2 = locate(0.5)
+    if not x2 then
+        x2, _, z2 = locate(1)
+    end
+
+    local returned = turtle.back()
+    if not returned then
+        local attempts = 0
+        while attempts < 5 and not returned do
+            returned = turtle.back()
+            attempts = attempts + 1
+            if not returned and sleep then
+                sleep(0)
+            end
+        end
+        if not returned then
+            if logger then
+                logger:warn("Facing detection failed to restore the turtle's start position; adjust the turtle manually and rerun.")
+            end
+            return nil, "return_failed"
+        end
+    end
+
+    if not x2 then
+        return nil, "gps_second_failed"
+    end
+
+    local dx = x2 - x1
+    local dz = z2 - z1
+    local threshold = 0.2
+
+    if math.abs(dx) < threshold and math.abs(dz) < threshold then
+        return nil, "gps_delta_small"
+    end
+
+    if math.abs(dx) >= math.abs(dz) then
+        if dx > threshold then
+            return "east"
+        elseif dx < -threshold then
+            return "west"
+        end
+    else
+        if dz > threshold then
+            return "south"
+        elseif dz < -threshold then
+            return "north"
+        end
+    end
+
+    return nil, "gps_delta_small"
+end
+
+local function resolveFacing(opts, logger)
+    if opts.facingProvided then
+        opts.facing = normaliseFacing(opts.facing)
+        if not opts.facing and logger then
+            logger:warn("Unknown facing provided; defaulting to north.")
+        end
+    elseif opts.dryRun then
+        if logger then
+            logger:info("Dry run requested; skipping automatic facing detection. Using configured facing.")
+        end
+    else
+        local detected, reason = detectFacingWithGps(logger)
+        if detected then
+            opts.facing = normaliseFacing(detected)
+            if logger and opts.facing then
+                logger:info(string.format("Detected turtle facing: %s (build will extend forward).", opts.facing))
+            end
+        else
+            local manualFacing
+            if type(read) == "function" then
+                print("Unable to auto-detect facing. Enter north/east/south/west or press Enter to assume north:")
+                while true do
+                    if type(write) == "function" then
+                        write("> ")
+                    else
+                        print("> ")
+                    end
+                    local response = read()
+                    if not response or response == "" then
+                        break
+                    end
+                    local normalised = normaliseFacing(response)
+                    if normalised then
+                        manualFacing = normalised
+                        break
+                    end
+                    print("Please enter north, east, south, or west.")
+                end
+            end
+
+            if manualFacing then
+                opts.facing = manualFacing
+                if logger then
+                    local message = reason and string.format("Auto facing detection unavailable (%s); using manual input: %s.", reason, manualFacing) or string.format("Auto facing detection unavailable; using manual input: %s.", manualFacing)
+                    logger:info(message)
+                end
+            else
+                opts.facing = normaliseFacing(opts.facing)
+                if not opts.facing then
+                    opts.facing = "north"
+                end
+
+                if logger then
+                    local message
+                    if reason == "gps_unavailable" then
+                        message = "GPS unavailable; defaulting to north. Use --facing to override."
+                    elseif reason == "forward_blocked" then
+                        message = "Unable to move forward to detect facing; defaulting to north. Clear space or use --facing."
+                    elseif reason == "turtle_api_unavailable" then
+                        message = "Turtle API unavailable for facing detection; defaulting to north."
+                    elseif reason == "return_failed" then
+                        message = "Automatic facing detection failed to restore the turtle's position; defaulting to north. Realign and rerun if the build origin shifted."
+                    elseif reason == "gps_initial_failed" or reason == "gps_second_failed" then
+                        message = "GPS locate did not respond; defaulting to north. Ensure a GPS network is available or use --facing."
+                    elseif reason == "gps_delta_small" then
+                        message = "GPS delta too small to determine facing; defaulting to north. Retry after improving signal or use --facing."
+                    else
+                        message = "Unable to detect facing automatically; defaulting to north. Use --facing to override."
+                    end
+                    logger:warn(message)
+                end
+            end
+        end
+    end
+
+    opts.facing = normaliseFacing(opts.facing) or "north"
+end
+
 local function parseArgs(raw)
     local opts = {
         schemaPath = nil,
         offset = nil,
         offsetProvided = false,
-        facing = "north",
+        facing = nil,
+        facingProvided = false,
         dryRun = false,
         verbose = false,
         parkClearance = 2,
@@ -173,6 +332,7 @@ local function parseArgs(raw)
                 return opts
             end
             opts.facing = value:lower()
+            opts.facingProvided = true
             i = i + 2
         elseif arg == "--offset" then
             local ox, oy, oz = raw[i + 1], raw[i + 2], raw[i + 3]
@@ -497,6 +657,16 @@ local function travelTo(ctx, target, travelClearance)
     return true
 end
 
+local function ensureFacing(ctx, facing, logger)
+    if not facing then
+        return
+    end
+    local ok, err = movement.faceDirection(ctx, facing)
+    if not ok and logger then
+        logger:warn(string.format("Unable to set facing to %s: %s", tostring(facing), tostring(err)))
+    end
+end
+
 local function returnToOrigin(ctx, opts, bounds, logger)
     -- Route the turtle home via a safe overhead waypoint to avoid freshly placed blocks.
     if opts.dryRun then
@@ -702,16 +872,6 @@ local function logMaterialAvailability(logger, report, verbose)
     end
 end
 
-local function ensureFacing(ctx, facing, logger)
-    if not facing then
-        return
-    end
-    local ok, err = movement.setFacing(ctx, facing)
-    if not ok then
-        logger:warn(string.format("Unable to set facing to %s: %s", tostring(facing), tostring(err)))
-    end
-end
-
 local function run(rawArgs)
     local opts = parseArgs(rawArgs)
     if opts.showHelp then
@@ -737,6 +897,8 @@ local function run(rawArgs)
         return
     end
     opts.schemaPath = selectedSchema
+
+    resolveFacing(opts, logger)
 
     if not opts.offsetProvided then
         promptStartCell(opts, logger)
