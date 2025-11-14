@@ -341,14 +341,20 @@ function placement.placeMaterial(ctx, material, opts)
             state.lastPlacement = { success = true, material = material, reused = true, side = side }
             return true, "already_present"
         end
-        if not allowOverwrite then
+
+        local needsReplacement = not (blockData and blockData.name == material)
+        local canForce = allowOverwrite or needsReplacement
+
+        if not canForce then
             state.lastPlacement = { success = false, material = material, error = "occupied", side = side }
             return false, "occupied"
         end
+
         local cleared = clearBlockingBlock(sideFns, allowDig, allowAttack)
         if not cleared then
-            state.lastPlacement = { success = false, material = material, error = "blocked", side = side }
-            return false, "blocked"
+            local reason = needsReplacement and "mismatched_block" or "blocked"
+            state.lastPlacement = { success = false, material = material, error = reason, side = side }
+            return false, reason
         end
     end
 

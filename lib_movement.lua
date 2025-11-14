@@ -280,19 +280,20 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
         end
 
         local handled = false
-        if moveFns.detect and moveFns.detect() then
-            if allowDig and moveFns.dig then
-                handled = moveFns.dig()
-                if handled then
-                    log(ctx, "debug", "Dug blocking block")
-                end
+
+        if allowAttack and moveFns.attack then
+            if moveFns.attack() then
+                handled = true
+                log(ctx, "debug", "Attacked entity blocking movement")
             end
-        else
-            if allowAttack and moveFns.attack then
-                handled = moveFns.attack()
-                if handled then
-                    log(ctx, "debug", "Attacked entity blocking movement")
-                end
+        end
+
+        local blocked = moveFns.detect and moveFns.detect() or false
+
+        if blocked and allowDig and moveFns.dig then
+            if moveFns.dig() then
+                handled = true
+                log(ctx, "debug", "Dug blocking block")
             end
         end
 

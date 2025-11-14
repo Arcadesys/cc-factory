@@ -6,11 +6,13 @@ position. Designed as a starter so you can iterate on more advanced
 state-machine driven agents later.
 
 Usage (on the turtle):
-  3dprinter [schema.txt] [--offset x y z] [--facing dir] [--dry-run] [--verbose]
+    3dprinter [schema.txt] [--offset x y z] [--facing dir] [--dry-run] [--verbose]
+
+All offsets are specified in turtle-local coordinates (x = right/left, y = up/down, z = forward/back).
 
 Defaults:
     * If no schema path is supplied, the script lists detected schemas and selects the first entry (the sample file if present).
-    * If no offset is provided, you will be prompted to choose a start cell; pressing Enter keeps option 2 (the block in front).
+    * If no offset is provided, you will be prompted to choose an orientation; pressing Enter keeps option 1 (forward + left).
     * Facing defaults to north. Adjust if your turtle starts facing another way.
 
 The script expects to run on a turtle with the cc-factory libraries on its disk.
@@ -33,7 +35,7 @@ Usage:
   3dprinter [schema_path] [options]
 
 Options:
-    --offset <x> <y> <z>   Skip the start-cell prompt and use these offsets directly
+    --offset <x> <y> <z>   Skip the orientation prompt using LOCAL offsets (x=right, y=up, z=forward)
   --facing <dir>         Initial/home facing (north|south|east|west)
   --dry-run              Preview the build order without moving or placing
   --verbose              Enable verbose logging (debug level)
@@ -49,16 +51,50 @@ Example:
   3dprinter schema_printer_sample.txt --offset 0 0 3 --facing south
 ]]
 
-local START_CELL_OFFSETS = {
-    [1] = { x = -1, z = -1 },
-    [2] = { x = 0,  z = -1 },
-    [3] = { x = 1,  z = -1 },
-    [4] = { x = -1, z = 0 },
-    [5] = { x = 1,  z = 0 },
-    [6] = { x = -1, z = 1 },
-    [7] = { x = 0,  z = 1 },
-    [8] = { x = 1,  z = 1 },
+local START_ORIENTATIONS = {
+    [1] = { label = "Forward + Left", key = "forward_left" },
+    [2] = { label = "Forward + Right", key = "forward_right" },
 }
+local DEFAULT_ORIENTATION = 1
+
+local function resolveOrientationKey(raw)
+    if type(raw) == "string" then
+        local key = raw:lower()
+        if key == "forward_left" or key == "forward-left" or key == "left" or key == "l" then
+            return "forward_left"
+        elseif key == "forward_right" or key == "forward-right" or key == "right" or key == "r" then
+            return "forward_right"
+        end
+    elseif type(raw) == "number" and START_ORIENTATIONS[raw] then
+        return START_ORIENTATIONS[raw].key
+    end
+    return START_ORIENTATIONS[DEFAULT_ORIENTATION].key
+end
+
+local function computeLocalXZ(bounds, x, z, orientationKey)
+    -- Map schema coordinates so every build starts one block forward and diagonally offset from the turtle.
+    local orientation = resolveOrientationKey(orientationKey)
+    local relativeX = x - bounds.minX
+    local relativeZ = z - bounds.minZ
+    local localZ = - (relativeZ + 1)
+    local localX
+    if orientation == "forward_right" then
+        localX = relativeX + 1
+    else
+        localX = - (relativeX + 1)
+    end
+    return localX, localZ
+end
+
+local function orientationLabel(key)
+    local resolved = resolveOrientationKey(key)
+    for _, entry in pairs(START_ORIENTATIONS) do
+        if entry.key == resolved then
+            return entry.label
+        end
+    end
+    return START_ORIENTATIONS[DEFAULT_ORIENTATION].label
+end
 
 local function normaliseFacing(facing)
     facing = type(facing) == "string" and facing:lower() or "north"
@@ -93,51 +129,90 @@ local function rotateLocalOffset(localOffset, facing)
     }
 end
 
+local function rotateWorldOffsetToLocal(worldOffset, facing)
+    facing = normaliseFacing(facing)
+    local dx = worldOffset and worldOffset.x or 0
+    local dz = worldOffset and worldOffset.z or 0
+    local result = {
+        x = 0,
+        y = worldOffset and worldOffset.y or 0,
+        z = 0,
+    }
+    if facing == "north" then
+        result.x = dx
+        result.z = dz
+    elseif facing == "east" then
+        result.x = dz
+        result.z = -dx
+    elseif facing == "south" then
+        result.x = -dx
+        result.z = -dz
+    else -- west
+        result.x = -dz
+        result.z = dx
+    end
+    return result
+end
+
+local function localToWorld(localOffset, facing)
+    facing = normaliseFacing(facing)
+    local dx = localOffset and localOffset.x or 0
+    local dz = localOffset and localOffset.z or 0
+    local rotated = rotateLocalOffset({ x = dx, z = dz }, facing)
+    return {
+        x = rotated.x,
+        y = localOffset and localOffset.y or 0,
+        z = rotated.z,
+    }
+end
+
 local function promptStartCell(opts, logger)
     if opts.offsetProvided then
         return
     end
 
-    local selection = 2
+    local selection = DEFAULT_ORIENTATION
     if type(read) == "function" then
         print("")
-        print("Select build start location relative to the turtle (arrow = front):")
-        print(" [1][2][3]")
-        print(" [4][^][5]")
-        print(" [6][7][8]")
+        print("Select build orientation relative to the turtle (arrow = front):")
+        print(" 1) Forward + Left (front-left corner)")
+        print(" 2) Forward + Right (front-right corner)")
+        print("Local axes: x = right/left, z = forward/back, y = up/down")
+        print("Reference (top-down):")
+        print(" L . R")
+        print(" . T C")
+        print("T = turtle, C = optional chest")
 
         while true do
             if type(write) == "function" then
-                write("Enter 1-8 (default 2): ")
+                write("Enter 1-2 (default 1): ")
             else
-                print("Enter 1-8 (default 2): ")
+                print("Enter 1-2 (default 1): ")
             end
             local response = read()
             if not response or response == "" then
                 break
             end
             local value = tonumber(response)
-            if value and START_CELL_OFFSETS[value] then
+            if value and START_ORIENTATIONS[value] then
                 selection = value
                 break
             end
-            print("Please enter a number between 1 and 8.")
+            print("Please enter a number between 1 and 2.")
         end
     elseif logger then
-        logger:info("Input unavailable; defaulting start location to 2 (front).")
+        logger:info("Input unavailable; defaulting orientation to option 1 (forward + left).")
     end
 
-    local offsetLocal = START_CELL_OFFSETS[selection] or START_CELL_OFFSETS[2]
-    local rotated = rotateLocalOffset(offsetLocal, opts.facing)
-    opts.offset = {
-        x = rotated.x,
-        y = 0,
-        z = rotated.z,
-    }
+    local choice = START_ORIENTATIONS[selection] or START_ORIENTATIONS[DEFAULT_ORIENTATION]
+    opts.orientation = resolveOrientationKey(choice.key or opts.orientation)
+    opts.offsetLocal = opts.offsetLocal or { x = 0, y = 0, z = 0 }
+    opts.offset = localToWorld(opts.offsetLocal, opts.facing)
     opts.startCell = selection
     if logger then
-        logger:info(string.format("Using start cell %d (offset x=%d, z=%d)", selection, opts.offset.x, opts.offset.z))
+        logger:info(string.format("Using orientation %s", choice.label))
     end
+    opts.orientationLogged = true
 end
 
 local function detectFacingWithGps(logger)
@@ -213,7 +288,7 @@ local function detectFacingWithGps(logger)
         if dz > threshold then
             return "south"
         elseif dz < -threshold then
-            return "north"
+        logger:info(string.format("Using orientation %s", choice.label))
         end
     end
 
@@ -302,6 +377,7 @@ local function parseArgs(raw)
     local opts = {
         schemaPath = nil,
         offset = nil,
+        offsetLocal = nil,
         offsetProvided = false,
         facing = nil,
         facingProvided = false,
@@ -311,6 +387,7 @@ local function parseArgs(raw)
         travelClearance = 1,
         minFuel = 80,
         listSchemas = false,
+        orientation = START_ORIENTATIONS[DEFAULT_ORIENTATION].key,
     }
 
     local i = 1
@@ -345,7 +422,7 @@ local function parseArgs(raw)
                 opts.parseError = "--offset values must be numbers"
                 return opts
             end
-            opts.offset = { x = ox, y = oy, z = oz }
+            opts.offsetLocal = { x = ox, y = oy, z = oz }
             opts.offsetProvided = true
             i = i + 4
         elseif arg == "--park" then
@@ -531,15 +608,15 @@ local function isPlaceable(block)
     return true
 end
 
-local function computeApproach(worldPos, side)
+local function computeApproachLocal(localPos, side)
     side = side or "down"
     if side == "up" then
-        return { x = worldPos.x, y = worldPos.y - 1, z = worldPos.z }, side
+        return { x = localPos.x, y = localPos.y - 1, z = localPos.z }, side
     elseif side == "down" then
-        return { x = worldPos.x, y = worldPos.y + 1, z = worldPos.z }, side
+        return { x = localPos.x, y = localPos.y + 1, z = localPos.z }, side
     else
         -- Treat any other directive as forward placement from the block position.
-        return { x = worldPos.x, y = worldPos.y, z = worldPos.z }, side
+        return { x = localPos.x, y = localPos.y, z = localPos.z }, side
     end
 end
 
@@ -580,12 +657,17 @@ local function normaliseBounds(info)
     }
 end
 
-local function buildOrder(schema, info, offset)
+local function buildOrder(schema, info, opts)
     local bounds, err = normaliseBounds(info)
     if not bounds then
         return nil, err or "missing_bounds"
     end
-    offset = offset or { x = 0, y = 0, z = 0 }
+    opts = opts or {}
+    local offsetLocal = opts.offsetLocal or { x = 0, y = 0, z = 0 }
+    local offsetXLocal = offsetLocal.x or 0
+    local offsetYLocal = offsetLocal.y or 0
+    local offsetZLocal = offsetLocal.z or 0
+    local orientation = resolveOrientationKey(opts.orientation)
 
     local order = {}
     for y = bounds.minY, bounds.maxY do
@@ -599,18 +681,19 @@ local function buildOrder(schema, info, offset)
             while true do
                 local block = getBlock(schema, x, y, z)
                 if isPlaceable(block) then
-                    local worldPos = {
-                        x = x + offset.x,
-                        y = y + offset.y,
-                        z = z + offset.z,
+                    local baseX, baseZ = computeLocalXZ(bounds, x, z, orientation)
+                    local localPos = {
+                        x = baseX + offsetXLocal,
+                        y = y + offsetYLocal,
+                        z = baseZ + offsetZLocal,
                     }
                     local meta = (block and type(block.meta) == "table") and block.meta or nil
                     local side = (meta and meta.side) or "down"
-                    local approach, resolvedSide = computeApproach(worldPos, side)
+                    local approach, resolvedSide = computeApproachLocal(localPos, side)
                     order[#order + 1] = {
                         schemaPos = { x = x, y = y, z = z },
-                        worldPos = worldPos,
-                        approach = approach,
+                        localPos = localPos,
+                        approachLocal = approach,
                         block = block,
                         side = resolvedSide,
                     }
@@ -682,7 +765,8 @@ local function returnToOrigin(ctx, opts, bounds, logger)
     local origin = ctx.origin or { x = 0, y = 0, z = 0 }
     local safeY = math.max(current.y, origin.y)
     if bounds then
-        safeY = math.max(safeY, (bounds.maxY + opts.offset.y) + opts.parkClearance)
+        local offsetLocalY = (opts.offsetLocal and opts.offsetLocal.y) or 0
+        safeY = math.max(safeY, (bounds.maxY + offsetLocalY) + opts.parkClearance)
     else
         safeY = safeY + math.max(0, opts.parkClearance)
     end
@@ -718,6 +802,91 @@ local function returnToOrigin(ctx, opts, bounds, logger)
 
     ensureFacing(ctx, opts.facing, logger)
     return true
+end
+
+local function awaitMaterialRefill(ctx, opts, bounds, step, logger)
+    if not step or not step.block or not step.block.material then
+        return false
+    end
+
+    local material = step.block.material
+    if logger then
+        logger:error(string.format("Out of %s; pausing print until restocked.", material))
+    end
+
+    if not opts.dryRun then
+        local homeOk, homeErr = returnToOrigin(ctx, opts, bounds, logger)
+        if not homeOk and logger then
+            logger:warn(string.format("Unable to return home while waiting for %s: %s", material, tostring(homeErr)))
+        end
+    end
+
+    if type(read) ~= "function" then
+        if logger then
+            logger:error("Input unavailable; cannot await manual restock. Aborting print.")
+        end
+        return false
+    end
+
+    print("")
+    print(string.format("Refill %s, then press Enter to resume. Type 'abort' to cancel the print.", material))
+
+    while true do
+        if type(write) == "function" then
+            write("> ")
+        else
+            print("> ")
+        end
+        local response = read()
+        local trimmed = response and response:gsub("^%s+", ""):gsub("%s+$", "") or ""
+
+        if trimmed == "" then
+            inventory.invalidate(ctx)
+            local total, err = inventory.countMaterial(ctx, material, { force = true })
+            if err then
+                if logger then
+                    logger:warn(string.format("Inventory scan failed while waiting for %s: %s", material, tostring(err)))
+                end
+            elseif total and total > 0 then
+                if logger then
+                    logger:info(string.format("Detected %d x %s; resuming print.", total, material))
+                end
+                return true
+            else
+                print(string.format("Still missing %s. Restock and press Enter to retry, or type 'abort' to stop.", material))
+            end
+        else
+            local lower = trimmed:lower()
+            if lower == "abort" or lower == "stop" or lower == "quit" or lower == "exit" then
+                if logger then
+                    logger:warn("Print aborted by user during restock pause.")
+                end
+                return false
+            else
+                print("Press Enter to retry once materials are available, or type 'abort' to cancel.")
+            end
+        end
+    end
+end
+
+local function handlePlacementFailure(ctx, opts, bounds, step, reason, logger)
+    reason = reason or "unknown"
+    if reason == "missing_material" then
+        local resumed = awaitMaterialRefill(ctx, opts, bounds, step, logger)
+        if resumed then
+            return "retry"
+        end
+        return "abort"
+    end
+
+    if logger then
+        if step and step.localPos then
+            logger:error(string.format("Placement failed at local (%d,%d,%d) with reason '%s'; aborting print.", step.localPos.x or 0, step.localPos.y or 0, step.localPos.z or 0, tostring(reason)))
+        else
+            logger:error(string.format("Placement failed with reason '%s'; aborting print.", tostring(reason)))
+        end
+    end
+    return "abort"
 end
 
 local function readFuel()
@@ -903,15 +1072,24 @@ local function run(rawArgs)
     if not opts.offsetProvided then
         promptStartCell(opts, logger)
     else
-        opts.offset = opts.offset or { x = 0, y = 0, z = 0 }
+        opts.offsetLocal = opts.offsetLocal or { x = 0, y = 0, z = 0 }
+        opts.offset = localToWorld(opts.offsetLocal, opts.facing)
         if logger then
-            logger:info(string.format("Using CLI offset x=%d y=%d z=%d", opts.offset.x, opts.offset.y, opts.offset.z))
+            logger:info(string.format("Using CLI local offset x=%d y=%d z=%d", opts.offsetLocal.x, opts.offsetLocal.y, opts.offsetLocal.z))
         end
     end
 
-    if not opts.offset then
-        -- Fallback for non-interactive environments
-        opts.offset = { x = 0, y = 0, z = -1 }
+    if not opts.offsetLocal then
+        -- Fallback for non-interactive environments: zero offset with default orientation
+        opts.offsetLocal = { x = 0, y = 0, z = 0 }
+    else
+        opts.offsetLocal.x = opts.offsetLocal.x or 0
+        opts.offsetLocal.y = opts.offsetLocal.y or 0
+        opts.offsetLocal.z = opts.offsetLocal.z or 0
+    end
+    opts.offset = localToWorld(opts.offsetLocal, opts.facing)
+    if logger and not opts.orientationLogged then
+        logger:info(string.format("Orientation set to %s.", orientationLabel(opts.orientation)))
     end
 
     local ctx = {
@@ -977,7 +1155,7 @@ local function run(rawArgs)
         return
     end
 
-    local order, boundsOrErr = buildOrder(schema, info, opts.offset)
+    local order, boundsOrErr = buildOrder(schema, info, opts)
     if not order then
         logger:error("Unable to derive build order: " .. tostring(boundsOrErr))
         return
@@ -1030,70 +1208,103 @@ local function run(rawArgs)
         end
     end
 
-    local stats = { placed = 0, reused = 0, skipped = 0, failures = 0 }
-    for index, step in ipairs(order) do
+    local stats = { placed = 0, reused = 0, skipped = 0, failures = 0, pauses = 0 }
+    local aborted = false
+    local index = 1
+    while index <= #order do
+        local step = order[index]
         ctx.pointer = step.schemaPos
-        logger:info(string.format("[%d/%d] %s at (%d,%d,%d)", index, #order, step.block.material, step.worldPos.x, step.worldPos.y, step.worldPos.z))
+        local localPos = step.localPos or { x = 0, y = 0, z = 0 }
+        logger:info(string.format("[%d/%d] %s local (%d,%d,%d)", index, #order, step.block.material, localPos.x, localPos.y, localPos.z))
+        if opts.verbose then
+            local worldPreview = localToWorld(localPos, opts.facing)
+            logger:debug(string.format("  world approx (%d,%d,%d)", worldPreview.x, worldPreview.y, worldPreview.z))
+        end
 
         if opts.dryRun then
             stats.skipped = stats.skipped + 1
+            index = index + 1
         else
-            local threshold = (ctx.fuelState and ctx.fuelState.threshold) or opts.minFuel or 0
-            local computedReserve = (ctx.fuelState and ctx.fuelState.reserve) or math.max(threshold * 2, threshold + 64)
-            local reserve = (computedReserve and computedReserve > 0) and computedReserve or nil
-            local fuelOk, fuelStatus = fuelLib.ensure(ctx, {
-                threshold = threshold,
-                reserve = reserve,
-                target = reserve,
-                rounds = 2,
-            })
-            ctx.fuelStatus = fuelStatus
-            if not fuelOk then
-                logger:error("Fuel check failed; stopping print.")
-                if fuelStatus and fuelStatus.service then
-                    local service = fuelStatus.service
-                    if service.returnError then
-                        logger:error("SERVICE return failed: " .. tostring(service.returnError))
-                    elseif service.error then
-                        logger:error("SERVICE error: " .. tostring(service.error))
+            local retryStep = true
+            while retryStep do
+                retryStep = false
+
+                local threshold = (ctx.fuelState and ctx.fuelState.threshold) or opts.minFuel or 0
+                local computedReserve = (ctx.fuelState and ctx.fuelState.reserve) or math.max(threshold * 2, threshold + 64)
+                local reserve = (computedReserve and computedReserve > 0) and computedReserve or nil
+                local fuelOk, fuelStatus = fuelLib.ensure(ctx, {
+                    threshold = threshold,
+                    reserve = reserve,
+                    target = reserve,
+                    rounds = 2,
+                })
+                ctx.fuelStatus = fuelStatus
+                if not fuelOk then
+                    logger:error("Fuel check failed; stopping print.")
+                    if fuelStatus and fuelStatus.service then
+                        local service = fuelStatus.service
+                        if service.returnError then
+                            logger:error("SERVICE return failed: " .. tostring(service.returnError))
+                        elseif service.error then
+                            logger:error("SERVICE error: " .. tostring(service.error))
+                        end
+                    elseif fuelStatus and fuelStatus.note then
+                        logger:warn(tostring(fuelStatus.note))
                     end
-                elseif fuelStatus and fuelStatus.note then
-                    logger:warn(tostring(fuelStatus.note))
+                    stats.failures = stats.failures + 1
+                    aborted = true
+                    break
                 end
-                stats.failures = stats.failures + 1
-                break
-            end
-            if fuelStatus and fuelStatus.level then
-                ctx.fuelState = ctx.fuelState or {}
-                ctx.fuelState.lastKnown = fuelStatus.level
+                if fuelStatus and fuelStatus.level then
+                    ctx.fuelState = ctx.fuelState or {}
+                    ctx.fuelState.lastKnown = fuelStatus.level
+                end
+
+                local approachLocal = step.approachLocal or localPos
+                local approachWorld = localToWorld(approachLocal, opts.facing)
+                local travelOk, travelErr = travelTo(ctx, approachWorld, opts.travelClearance)
+                if not travelOk then
+                    local level, limit = readFuel()
+                    if level then
+                        local suffix = limit and string.format("/%d", limit) or ""
+                        logger:error(string.format("Fuel remaining at failure: %d%s", level, suffix))
+                        if level <= 0 then
+                            logger:error("Turtle is out of fuel; supply fuel and rerun.")
+                        end
+                    end
+                    logger:error("Movement failed: " .. tostring(travelErr))
+                    stats.failures = stats.failures + 1
+                    aborted = true
+                    break
+                end
+
+                ensureFacing(ctx, opts.facing, logger)
+                local placed, placeInfo = placement.placeMaterial(ctx, step.block.material, { side = step.side, block = step.block, dig = true, attack = true })
+                if not placed then
+                    local action = handlePlacementFailure(ctx, opts, bounds, step, placeInfo, logger)
+                    if action == "retry" then
+                        stats.pauses = stats.pauses + 1
+                        retryStep = true
+                    else
+                        stats.failures = stats.failures + 1
+                        aborted = true
+                    end
+                else
+                    if placeInfo == "already_present" then
+                        stats.reused = stats.reused + 1
+                    else
+                        stats.placed = stats.placed + 1
+                    end
+                    index = index + 1
+                end
+
+                if aborted then
+                    break
+                end
             end
 
-            local travelOk, travelErr = travelTo(ctx, step.approach, opts.travelClearance)
-            if not travelOk then
-                local level, limit = readFuel()
-                if level then
-                    local suffix = limit and string.format("/%d", limit) or ""
-                    logger:error(string.format("Fuel remaining at failure: %d%s", level, suffix))
-                    if level <= 0 then
-                        logger:error("Turtle is out of fuel; supply fuel and rerun.")
-                    end
-                end
-                logger:error("Movement failed: " .. tostring(travelErr))
-                stats.failures = stats.failures + 1
+            if aborted then
                 break
-            end
-
-            ensureFacing(ctx, opts.facing, logger)
-            local placed, placeInfo = placement.placeMaterial(ctx, step.block.material, { side = step.side, block = step.block, dig = true, attack = true })
-            if not placed then
-                logger:error("Placement failed: " .. tostring(placeInfo))
-                stats.failures = stats.failures + 1
-                break
-            end
-            if placeInfo == "already_present" then
-                stats.reused = stats.reused + 1
-            else
-                stats.placed = stats.placed + 1
             end
         end
     end
@@ -1104,6 +1315,9 @@ local function run(rawArgs)
     end
 
     logger:info(string.format("Placed: %d, reused: %d, skipped: %d, failures: %d", stats.placed, stats.reused, stats.skipped, stats.failures))
+    if stats.pauses and stats.pauses > 0 then
+        logger:info(string.format("Manual restock pauses: %d", stats.pauses))
+    end
     if stats.failures == 0 then
         logger:info("Print complete.")
     else
