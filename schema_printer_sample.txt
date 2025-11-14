@@ -1,0 +1,34 @@
+legend:
+# = minecraft:stone_bricks
+G = minecraft:glass
+L = minecraft:lantern
+T = minecraft:torch
+. = minecraft:air
+
+layer:0
+.....
+.###.
+.###.
+.###.
+.....
+
+layer:1
+.....
+.#G#.
+.#L#.
+.#G#.
+.....
+
+layer:2
+.....
+..#..
+..#..
+..#..
+.....
+
+layer:3
+.....
+.....
+..T..
+.....
+.....

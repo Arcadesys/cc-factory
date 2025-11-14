@@ -9,6 +9,7 @@ optional error messages.
 ---@diagnostic disable: undefined-global
 
 local inventory = {}
+local movement = require("lib_movement")
 
 local SIDE_ACTIONS = {
     forward = {
@@ -41,6 +42,10 @@ local function log(ctx, level, message)
     if type(logger.log) == "function" then
         logger.log(level, message)
     end
+end
+
+local function noop()
+    return
 end
 
 local function copySummary(tbl)
@@ -98,6 +103,165 @@ local function resolveSide(opts)
         return "forward"
     end
     return side
+end
+
+local CONTAINER_KEYWORDS = {
+    "chest",
+    "barrel",
+    "drawer",
+    "crate",
+    "shulker_box",
+    "shulkerbox",
+}
+
+local function hasContainerTag(tags)
+    if type(tags) ~= "table" then
+        return false
+    end
+    for key, value in pairs(tags) do
+        if value and type(key) == "string" then
+            local lower = key:lower()
+            for _, keyword in ipairs(CONTAINER_KEYWORDS) do
+                if lower:find(keyword, 1, true) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function isContainerBlock(name, tags)
+    if type(name) ~= "string" then
+        return false
+    end
+    local lower = name:lower()
+    for _, keyword in ipairs(CONTAINER_KEYWORDS) do
+        if lower:find(keyword, 1, true) then
+            return true
+        end
+    end
+    return hasContainerTag(tags)
+end
+
+local function inspectForwardForContainer()
+    if not turtle or type(turtle.inspect) ~= "function" then
+        return false
+    end
+    local ok, data = turtle.inspect()
+    if not ok or type(data) ~= "table" then
+        return false
+    end
+    return isContainerBlock(data.name, data.tags)
+end
+
+local function shouldSearchAllSides(opts)
+    if type(opts) ~= "table" then
+        return true
+    end
+    if opts.searchAllSides == false then
+        return false
+    end
+    return true
+end
+
+local function ensureChestAhead(ctx, opts)
+    if not shouldSearchAllSides(opts) then
+        return true, noop
+    end
+    if inspectForwardForContainer() then
+        return true, noop
+    end
+    if not turtle then
+        return true, noop
+    end
+
+    movement.ensureState(ctx)
+    local startFacing = movement.getFacing(ctx)
+
+    local function restoreToStart()
+        if startFacing then
+            movement.faceDirection(ctx, startFacing)
+        end
+    end
+
+    -- Check left
+    local ok, err = movement.turnLeft(ctx)
+    if not ok then
+        restoreToStart()
+        return false, err or "turn_failed"
+    end
+    if inspectForwardForContainer() then
+        log(ctx, "debug", "Found container on left side; using that")
+        return true, function()
+            movement.turnRight(ctx)
+            if startFacing and movement.getFacing(ctx) ~= startFacing then
+                movement.faceDirection(ctx, startFacing)
+            end
+        end
+    end
+    ok, err = movement.turnRight(ctx)
+    if not ok then
+        restoreToStart()
+        return false, err or "turn_failed"
+    end
+
+    -- Check behind (turn right twice from original orientation)
+    ok, err = movement.turnRight(ctx)
+    if not ok then
+        restoreToStart()
+        return false, err or "turn_failed"
+    end
+    ok, err = movement.turnRight(ctx)
+    if not ok then
+        restoreToStart()
+        return false, err or "turn_failed"
+    end
+    if inspectForwardForContainer() then
+        log(ctx, "debug", "Found container behind; using that")
+        return true, function()
+            movement.turnLeft(ctx)
+            movement.turnLeft(ctx)
+            if startFacing and movement.getFacing(ctx) ~= startFacing then
+                movement.faceDirection(ctx, startFacing)
+            end
+        end
+    end
+    -- Restore to original orientation before next check
+    ok, err = movement.turnLeft(ctx)
+    if not ok then
+        restoreToStart()
+        return false, err or "turn_failed"
+    end
+    ok, err = movement.turnLeft(ctx)
+    if not ok then
+        restoreToStart()
+        return false, err or "turn_failed"
+    end
+
+    -- Check right
+    ok, err = movement.turnRight(ctx)
+    if not ok then
+        restoreToStart()
+        return false, err or "turn_failed"
+    end
+    if inspectForwardForContainer() then
+        log(ctx, "debug", "Found container on right side; using that")
+        return true, function()
+            movement.turnLeft(ctx)
+            if startFacing and movement.getFacing(ctx) ~= startFacing then
+                movement.faceDirection(ctx, startFacing)
+            end
+        end
+    end
+    ok, err = movement.turnLeft(ctx)
+    if not ok then
+        restoreToStart()
+        return false, err or "turn_failed"
+    end
+
+    restoreToStart()
+    return false, "container_not_found"
 end
 
 local function ensureInventoryState(ctx)
@@ -382,8 +546,22 @@ function inventory.pushSlot(ctx, slot, amount, opts)
         return false, err
     end
 
+    local restoreFacing = noop
+    if side == "forward" then
+        local chestOk, restoreFn, searchErr = ensureChestAhead(ctx, opts)
+        if not chestOk then
+            return false, searchErr or "container_not_found"
+        end
+        if type(restoreFn) ~= "function" then
+            restoreFacing = noop
+        else
+            restoreFacing = restoreFn
+        end
+    end
+
     local count = turtle.getItemCount and turtle.getItemCount(slot) or nil
     if count ~= nil and count <= 0 then
+        restoreFacing()
         return false, "empty_slot"
     end
 
@@ -393,9 +571,11 @@ function inventory.pushSlot(ctx, slot, amount, opts)
         ok = actions.drop()
     end
     if not ok then
+        restoreFacing()
         return false, "drop_failed"
     end
 
+    restoreFacing()
     rescanIfNeeded(ctx, opts)
     return true
 end
@@ -457,15 +637,30 @@ function inventory.pullMaterial(ctx, material, amount, opts)
         return false, selectErr
     end
 
+    local restoreFacing = noop
+    if side == "forward" then
+        local chestOk, restoreFn, searchErr = ensureChestAhead(ctx, opts)
+        if not chestOk then
+            return false, searchErr or "container_not_found"
+        end
+        if type(restoreFn) ~= "function" then
+            restoreFacing = noop
+        else
+            restoreFacing = restoreFn
+        end
+    end
+
     if amount and amount > 0 then
         ok = actions.suck(amount)
     else
         ok = actions.suck()
     end
     if not ok then
+        restoreFacing()
         return false, "suck_failed"
     end
 
+    restoreFacing()
     rescanIfNeeded(ctx, opts)
     if material then
         local hasMaterial, hasErr = inventory.hasMaterial(ctx, material, 1, { force = true })
