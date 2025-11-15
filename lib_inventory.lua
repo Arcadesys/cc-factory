@@ -228,7 +228,38 @@ local function inspectForwardForContainer()
     if not ok or type(data) ~= "table" then
         return false
     end
-    return isContainerBlock(data.name, data.tags)
+    if isContainerBlock(data.name, data.tags) then
+        return true, data
+    end
+    return false
+end
+
+local function inspectUpForContainer()
+    if not turtle or type(turtle.inspectUp) ~= "function" then
+        return false
+    end
+    local ok, data = turtle.inspectUp()
+    if not ok or type(data) ~= "table" then
+        return false
+    end
+    if isContainerBlock(data.name, data.tags) then
+        return true, data
+    end
+    return false
+end
+
+local function inspectDownForContainer()
+    if not turtle or type(turtle.inspectDown) ~= "function" then
+        return false
+    end
+    local ok, data = turtle.inspectDown()
+    if not ok or type(data) ~= "table" then
+        return false
+    end
+    if isContainerBlock(data.name, data.tags) then
+        return true, data
+    end
+    return false
 end
 
 local function shouldSearchAllSides(opts)
@@ -352,6 +383,131 @@ local function collectStacks(chest, material)
     return stacks
 end
 
+local function newContainerManifest()
+    return {
+        totals = {},
+        slots = {},
+        totalItems = 0,
+        orderedSlots = {},
+        size = nil,
+        metadata = nil,
+    }
+end
+
+local function addManifestEntry(manifest, slot, stack)
+    if type(manifest) ~= "table" or type(slot) ~= "number" then
+        return
+    end
+    if type(stack) ~= "table" then
+        return
+    end
+    local name = stack.name or stack.id
+    local count = stack.count or stack.qty or stack.quantity or stack.Count
+    if type(name) ~= "string" or type(count) ~= "number" or count <= 0 then
+        return
+    end
+    manifest.slots[slot] = {
+        name = name,
+        count = count,
+        tags = stack.tags,
+        nbt = stack.nbt,
+        displayName = stack.displayName or stack.label or stack.Name,
+        detail = stack,
+    }
+    manifest.totals[name] = (manifest.totals[name] or 0) + count
+    manifest.totalItems = manifest.totalItems + count
+end
+
+local function populateManifestSlots(manifest)
+    local ordered = {}
+    for slot in pairs(manifest.slots) do
+        ordered[#ordered + 1] = slot
+    end
+    table.sort(ordered)
+    manifest.orderedSlots = ordered
+
+    local materials = {}
+    for material in pairs(manifest.totals) do
+        materials[#materials + 1] = material
+    end
+    table.sort(materials)
+    manifest.materials = materials
+end
+
+local function attachMetadata(manifest, periphSide)
+    if not peripheral then
+        return
+    end
+    local metadata = manifest.metadata or {}
+    if type(peripheral.call) == "function" then
+        local okMeta, meta = pcall(peripheral.call, periphSide, "getMetadata")
+        if okMeta and type(meta) == "table" then
+            metadata.name = meta.name or metadata.name
+            metadata.displayName = meta.displayName or meta.label or metadata.displayName
+            metadata.tags = meta.tags or metadata.tags
+        end
+    end
+    if type(peripheral.getType) == "function" then
+        local okType, perType = pcall(peripheral.getType, periphSide)
+        if okType then
+            if type(perType) == "string" then
+                metadata.peripheralType = perType
+            elseif type(perType) == "table" and type(perType[1]) == "string" then
+                metadata.peripheralType = perType[1]
+            end
+        end
+    end
+    if next(metadata) ~= nil then
+        manifest.metadata = metadata
+    end
+end
+
+local function readContainerManifest(periphSide)
+    if not peripheral or type(peripheral.wrap) ~= "function" then
+        return nil, "peripheral_api_unavailable"
+    end
+
+    local wrapOk, chest = pcall(peripheral.wrap, periphSide)
+    if not wrapOk or type(chest) ~= "table" then
+        return nil, "wrap_failed"
+    end
+
+    local manifest = newContainerManifest()
+
+    if type(chest.list) == "function" then
+        local okList, list = pcall(chest.list)
+        if okList and type(list) == "table" then
+            for slot, stack in pairs(list) do
+                local numericSlot = tonumber(slot)
+                if numericSlot then
+                    addManifestEntry(manifest, numericSlot, stack)
+                end
+            end
+        end
+    end
+
+    local haveSlots = next(manifest.slots) ~= nil
+    if type(chest.size) == "function" then
+        local okSize, size = pcall(chest.size)
+        if okSize and type(size) == "number" and size >= 0 then
+            manifest.size = size
+            if not haveSlots and type(chest.getItemDetail) == "function" then
+                for slot = 1, size do
+                    local okDetail, detail = pcall(chest.getItemDetail, slot)
+                    if okDetail then
+                        addManifestEntry(manifest, slot, detail)
+                    end
+                end
+            end
+        end
+    end
+
+    populateManifestSlots(manifest)
+    attachMetadata(manifest, periphSide)
+
+    return manifest
+end
+
 local function extractFromContainer(ctx, periphSide, material, amount, targetSlot)
     if not material or not peripheral or type(peripheral.wrap) ~= "function" then
         return 0
@@ -400,102 +556,105 @@ local function extractFromContainer(ctx, periphSide, material, amount, targetSlo
 end
 
 local function ensureChestAhead(ctx, opts)
-    if not shouldSearchAllSides(opts) then
-        return true, noop
+    local frontOk, frontDetail = inspectForwardForContainer()
+    if frontOk then
+        return true, noop, { side = "forward", detail = frontDetail }
     end
-    if inspectForwardForContainer() then
-        return true, noop
+
+    if not shouldSearchAllSides(opts) then
+        return false, nil, nil, "container_not_found"
     end
     if not turtle then
-        return true, noop
+        return false, nil, nil, "turtle_api_unavailable"
     end
 
     movement.ensureState(ctx)
     local startFacing = movement.getFacing(ctx)
 
-    local function restoreToStart()
-        if startFacing then
-            movement.faceDirection(ctx, startFacing)
+    local function restoreFacing()
+        if not startFacing then
+            return
+        end
+        if movement.getFacing(ctx) ~= startFacing then
+            local okFace, faceErr = movement.faceDirection(ctx, startFacing)
+            if not okFace and faceErr then
+                log(ctx, "warn", "Failed to restore facing: " .. tostring(faceErr))
+            end
+        end
+    end
+
+    local function makeRestore()
+        if not startFacing then
+            return noop
+        end
+        return function()
+            restoreFacing()
         end
     end
 
     -- Check left
     local ok, err = movement.turnLeft(ctx)
     if not ok then
-        restoreToStart()
-        return false, err or "turn_failed"
+        restoreFacing()
+        return false, nil, nil, err or "turn_failed"
     end
-    if inspectForwardForContainer() then
+    local leftOk, leftDetail = inspectForwardForContainer()
+    if leftOk then
         log(ctx, "debug", "Found container on left side; using that")
-        return true, function()
-            movement.turnRight(ctx)
-            if startFacing and movement.getFacing(ctx) ~= startFacing then
-                movement.faceDirection(ctx, startFacing)
-            end
-        end
+        return true, makeRestore(), { side = "left", detail = leftDetail }
     end
     ok, err = movement.turnRight(ctx)
     if not ok then
-        restoreToStart()
-        return false, err or "turn_failed"
-    end
-
-    -- Check behind (turn right twice from original orientation)
-    ok, err = movement.turnRight(ctx)
-    if not ok then
-        restoreToStart()
-        return false, err or "turn_failed"
-    end
-    ok, err = movement.turnRight(ctx)
-    if not ok then
-        restoreToStart()
-        return false, err or "turn_failed"
-    end
-    if inspectForwardForContainer() then
-        log(ctx, "debug", "Found container behind; using that")
-        return true, function()
-            movement.turnLeft(ctx)
-            movement.turnLeft(ctx)
-            if startFacing and movement.getFacing(ctx) ~= startFacing then
-                movement.faceDirection(ctx, startFacing)
-            end
-        end
-    end
-    -- Restore to original orientation before next check
-    ok, err = movement.turnLeft(ctx)
-    if not ok then
-        restoreToStart()
-        return false, err or "turn_failed"
-    end
-    ok, err = movement.turnLeft(ctx)
-    if not ok then
-        restoreToStart()
-        return false, err or "turn_failed"
+        restoreFacing()
+        return false, nil, nil, err or "turn_failed"
     end
 
     -- Check right
     ok, err = movement.turnRight(ctx)
     if not ok then
-        restoreToStart()
-        return false, err or "turn_failed"
+        restoreFacing()
+        return false, nil, nil, err or "turn_failed"
     end
-    if inspectForwardForContainer() then
+    local rightOk, rightDetail = inspectForwardForContainer()
+    if rightOk then
         log(ctx, "debug", "Found container on right side; using that")
-        return true, function()
-            movement.turnLeft(ctx)
-            if startFacing and movement.getFacing(ctx) ~= startFacing then
-                movement.faceDirection(ctx, startFacing)
-            end
-        end
+        return true, makeRestore(), { side = "right", detail = rightDetail }
     end
     ok, err = movement.turnLeft(ctx)
     if not ok then
-        restoreToStart()
-        return false, err or "turn_failed"
+        restoreFacing()
+        return false, nil, nil, err or "turn_failed"
     end
 
-    restoreToStart()
-    return false, "container_not_found"
+    -- Check behind
+    ok, err = movement.turnRight(ctx)
+    if not ok then
+        restoreFacing()
+        return false, nil, nil, err or "turn_failed"
+    end
+    ok, err = movement.turnRight(ctx)
+    if not ok then
+        restoreFacing()
+        return false, nil, nil, err or "turn_failed"
+    end
+    local backOk, backDetail = inspectForwardForContainer()
+    if backOk then
+        log(ctx, "debug", "Found container behind; using that")
+        return true, makeRestore(), { side = "back", detail = backDetail }
+    end
+    ok, err = movement.turnLeft(ctx)
+    if not ok then
+        restoreFacing()
+        return false, nil, nil, err or "turn_failed"
+    end
+    ok, err = movement.turnLeft(ctx)
+    if not ok then
+        restoreFacing()
+        return false, nil, nil, err or "turn_failed"
+    end
+
+    restoreFacing()
+    return false, nil, nil, "container_not_found"
 end
 
 local function ensureInventoryState(ctx)
@@ -726,6 +885,100 @@ function inventory.snapshot(ctx, opts)
     }
 end
 
+function inventory.detectContainer(ctx, opts)
+    opts = opts or {}
+    local side = resolveSide(ctx, opts)
+    if side == "forward" then
+        local chestOk, restoreFn, info, err = ensureChestAhead(ctx, opts)
+        if not chestOk then
+            return nil, err or "container_not_found"
+        end
+        if type(restoreFn) == "function" then
+            restoreFn()
+        end
+        local result = info or { side = "forward" }
+        result.peripheralSide = "front"
+        return result
+    elseif side == "up" then
+        local okUp, detail = inspectUpForContainer()
+        if okUp then
+            return { side = "up", detail = detail, peripheralSide = "top" }
+        end
+        return nil, "container_not_found"
+    elseif side == "down" then
+        local okDown, detail = inspectDownForContainer()
+        if okDown then
+            return { side = "down", detail = detail, peripheralSide = "bottom" }
+        end
+        return nil, "container_not_found"
+    end
+    return nil, "unsupported_side"
+end
+
+function inventory.getContainerManifest(ctx, opts)
+    if not turtle then
+        return nil, "turtle API unavailable"
+    end
+    opts = opts or {}
+    local side = resolveSide(ctx, opts)
+    local periphSide = peripheralSideForDirection(side)
+    local restoreFacing = noop
+    local info
+
+    if side == "forward" then
+        local chestOk, restoreFn, chestInfo, err = ensureChestAhead(ctx, opts)
+        if not chestOk then
+            return nil, err or "container_not_found"
+        end
+        if type(restoreFn) == "function" then
+            restoreFacing = restoreFn
+        end
+        info = chestInfo or { side = "forward" }
+        periphSide = "front"
+    elseif side == "up" then
+        local okUp, detail = inspectUpForContainer()
+        if not okUp then
+            return nil, "container_not_found"
+        end
+        info = { side = "up", detail = detail }
+        periphSide = "top"
+    elseif side == "down" then
+        local okDown, detail = inspectDownForContainer()
+        if not okDown then
+            return nil, "container_not_found"
+        end
+        info = { side = "down", detail = detail }
+        periphSide = "bottom"
+    else
+        return nil, "unsupported_side"
+    end
+
+    local manifest, manifestErr = readContainerManifest(periphSide)
+    restoreFacing()
+    if not manifest then
+        return nil, manifestErr or "wrap_failed"
+    end
+
+    manifest.peripheralSide = periphSide
+    if info then
+        manifest.relativeSide = info.side
+        manifest.inspectDetail = info.detail
+        if not manifest.metadata and info.detail then
+            manifest.metadata = {
+                name = info.detail.name,
+                displayName = info.detail.displayName or info.detail.label,
+                tags = info.detail.tags,
+            }
+        elseif manifest.metadata and info.detail then
+            manifest.metadata.name = manifest.metadata.name or info.detail.name
+            manifest.metadata.displayName = manifest.metadata.displayName or info.detail.displayName or info.detail.label
+            manifest.metadata.tags = manifest.metadata.tags or info.detail.tags
+        end
+    end
+
+    return manifest
+end
+
 function inventory.selectMaterial(ctx, material, opts)
     if not turtle then
         return false, "turtle API unavailable"
@@ -782,14 +1035,22 @@ function inventory.pushSlot(ctx, slot, amount, opts)
 
     local restoreFacing = noop
     if side == "forward" then
-        local chestOk, restoreFn, searchErr = ensureChestAhead(ctx, opts)
+        local chestOk, restoreFn, _, searchErr = ensureChestAhead(ctx, opts)
         if not chestOk then
             return false, searchErr or "container_not_found"
         end
-        if type(restoreFn) ~= "function" then
-            restoreFacing = noop
-        else
+        if type(restoreFn) == "function" then
             restoreFacing = restoreFn
+        end
+    elseif side == "up" then
+        local okUp = inspectUpForContainer()
+        if not okUp then
+            return false, "container_not_found"
+        end
+    elseif side == "down" then
+        local okDown = inspectDownForContainer()
+        if not okDown then
+            return false, "container_not_found"
         end
     end
 
@@ -874,20 +1135,39 @@ function inventory.pullMaterial(ctx, material, amount, opts)
     local periphSide = peripheralSideForDirection(side)
     local restoreFacing = noop
     if side == "forward" then
-        local chestOk, restoreFn, searchErr = ensureChestAhead(ctx, opts)
+        local chestOk, restoreFn, _, searchErr = ensureChestAhead(ctx, opts)
         if not chestOk then
             return false, searchErr or "container_not_found"
         end
-        if type(restoreFn) ~= "function" then
-            restoreFacing = noop
-        else
+        if type(restoreFn) == "function" then
             restoreFacing = restoreFn
         end
+    elseif side == "up" then
+        local okUp = inspectUpForContainer()
+        if not okUp then
+            return false, "container_not_found"
+        end
+    elseif side == "down" then
+        local okDown = inspectDownForContainer()
+        if not okDown then
+            return false, "container_not_found"
+        end
+    end
+
+    local desired = nil
+    if material then
+        if amount and amount > 0 then
+            desired = math.min(amount, 64)
+        else
+            desired = 64
+        end
+    elseif amount and amount > 0 then
+        desired = amount
     end
 
     local transferred = 0
     if material then
-        transferred = extractFromContainer(ctx, periphSide, material, amount, targetSlot)
+        transferred = extractFromContainer(ctx, periphSide, material, desired, targetSlot)
         if transferred > 0 then
             restoreFacing()
             rescanIfNeeded(ctx, opts)
@@ -919,20 +1199,76 @@ function inventory.pullMaterial(ctx, material, amount, opts)
     end
 
     local stashSlots = {}
+    local stashSet = {}
+
+    local function addStashSlot(slot)
+        stashSlots[#stashSlots + 1] = slot
+        stashSet[slot] = true
+    end
+
+    local function markSlotEmpty(slot)
+        if not slot then
+            return
+        end
+        local info = state.slots[slot]
+        if info then
+            info.count = 0
+            info.name = nil
+            info.detail = nil
+        end
+        for index = #state.emptySlots, 1, -1 do
+            if state.emptySlots[index] == slot then
+                return
+            end
+        end
+        state.emptySlots[#state.emptySlots + 1] = slot
+    end
+
+    local function freeAdditionalSlot()
+        local pushOpts = makePushOpts()
+        pushOpts.deferScan = true
+        for slot = 16, 1, -1 do
+            if slot ~= targetSlot and not stashSet[slot] then
+                local count = turtle.getItemCount(slot)
+                if count > 0 then
+                    local info = state.slots[slot]
+                    if not info or info.name ~= material then
+                        local pushOk, pushErr = inventory.pushSlot(ctx, slot, nil, pushOpts)
+                        if pushOk then
+                            inventory.invalidate(ctx)
+                            markSlotEmpty(slot)
+                            local newState = ensureScanned(ctx, { force = true })
+                            if newState then
+                                state = newState
+                            end
+                            if turtle.getItemCount(slot) == 0 then
+                                return slot
+                            end
+                        else
+                            if pushErr then
+                                log(ctx, "debug", string.format("Unable to clear slot %d while restocking %s: %s", slot, material or "unknown", pushErr))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
 
     local function findTemporarySlot()
         for slot = 1, 16 do
-            if slot ~= targetSlot and turtle.getItemCount(slot) == 0 then
-                local used = false
-                for _, usedSlot in ipairs(stashSlots) do
-                    if usedSlot == slot then
-                        used = true
-                        break
-                    end
-                end
-                if not used then
-                    return slot
-                end
+            if slot ~= targetSlot and not stashSet[slot] and turtle.getItemCount(slot) == 0 then
+                return slot
+            end
+        end
+        local cleared = freeAdditionalSlot()
+        if cleared then
+            return cleared
+        end
+        for slot = 1, 16 do
+            if slot ~= targetSlot and not stashSet[slot] and turtle.getItemCount(slot) == 0 then
+                return slot
             end
         end
         return nil
@@ -952,11 +1288,12 @@ function inventory.pullMaterial(ctx, material, amount, opts)
         end
         turtle.select(targetSlot)
         inventory.invalidate(ctx)
-    end
-
-    local desired = nil
-    if amount and amount > 0 then
-        desired = math.min(amount, 64)
+        local newState = ensureScanned(ctx, { force = true })
+        if newState then
+            state = newState
+        end
+        stashSlots = {}
+        stashSet = {}
     end
 
     local cycles = 0
@@ -1004,7 +1341,7 @@ function inventory.pullMaterial(ctx, material, amount, opts)
                 failureReason = "transfer_failed"
                 break
             end
-            stashSlots[#stashSlots + 1] = stashSlot
+            addStashSlot(stashSlot)
             cycled = cycled + 1
             inventory.invalidate(ctx)
             turtle.select(targetSlot)
