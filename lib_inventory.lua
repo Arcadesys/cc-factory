@@ -895,39 +895,143 @@ function inventory.pullMaterial(ctx, material, amount, opts)
         end
     end
 
-    if amount and amount > 0 then
-        ok = actions.suck(amount)
-    else
-        ok = actions.suck()
-    end
-    if not ok then
+    if material == nil then
+        if amount and amount > 0 then
+            ok = actions.suck(amount)
+        else
+            ok = actions.suck()
+        end
+        if not ok then
+            restoreFacing()
+            return false, "suck_failed"
+        end
         restoreFacing()
-        return false, "suck_failed"
+        rescanIfNeeded(ctx, opts)
+        return true
     end
 
-    restoreFacing()
-    if material then
-        local detail = turtle.getItemDetail and turtle.getItemDetail(targetSlot) or nil
-        if not detail or detail.name ~= material then
-            if detail and detail.name then
-                log(ctx, "debug", string.format("Pulled %s while expecting %s; returning item", detail.name, material))
-            else
-                log(ctx, "debug", string.format("No %s received after pull; returning slot contents", material))
+    local function makePushOpts()
+        local pushOpts = { side = side }
+        if type(opts) == "table" and opts.searchAllSides ~= nil then
+            pushOpts.searchAllSides = opts.searchAllSides
+        end
+        return pushOpts
+    end
+
+    local stashSlots = {}
+
+    local function findTemporarySlot()
+        for slot = 1, 16 do
+            if slot ~= targetSlot and turtle.getItemCount(slot) == 0 then
+                local used = false
+                for _, usedSlot in ipairs(stashSlots) do
+                    if usedSlot == slot then
+                        used = true
+                        break
+                    end
+                end
+                if not used then
+                    return slot
+                end
             end
-            local pushOpts = { side = side }
-            if type(opts) == "table" and opts.searchAllSides ~= nil then
-                pushOpts.searchAllSides = opts.searchAllSides
-            end
-            local pushOk, pushErr = inventory.pushSlot(ctx, targetSlot, nil, pushOpts)
+        end
+        return nil
+    end
+
+    local function returnStash(deferScan)
+        if #stashSlots == 0 then
+            return
+        end
+        local pushOpts = makePushOpts()
+        pushOpts.deferScan = deferScan
+        for _, slot in ipairs(stashSlots) do
+            local pushOk, pushErr = inventory.pushSlot(ctx, slot, nil, pushOpts)
             if not pushOk and pushErr then
-                log(ctx, "warn", string.format("Failed to return unexpected item to chest: %s", tostring(pushErr)))
+                log(ctx, "warn", string.format("Failed to return cycled item from slot %d: %s", slot, tostring(pushErr)))
             end
-            rescanIfNeeded(ctx, opts)
-            return false, "wrong_material"
+        end
+        turtle.select(targetSlot)
+        inventory.invalidate(ctx)
+    end
+
+    local desired = nil
+    if amount and amount > 0 then
+        desired = math.min(amount, 64)
+    end
+
+    local cycles = 0
+    local maxCycles = (type(opts) == "table" and opts.cycleLimit) or 48
+    local success = false
+    local failureReason
+    local cycled = 0
+
+    while cycles < maxCycles do
+        cycles = cycles + 1
+        local currentCount = turtle.getItemCount(targetSlot)
+        if desired and currentCount >= desired then
+            success = true
+            break
+        end
+
+        local need = desired and math.max(desired - currentCount, 1) or nil
+        local pulled
+        if need then
+            pulled = actions.suck(math.min(need, 64))
+        else
+            pulled = actions.suck()
+        end
+        if not pulled then
+            failureReason = failureReason or "suck_failed"
+            break
+        end
+
+        local detail = turtle.getItemDetail and turtle.getItemDetail(targetSlot) or nil
+        local updatedCount = turtle.getItemCount(targetSlot)
+
+        if detail and detail.name == material then
+            if not desired or updatedCount >= desired then
+                success = true
+                break
+            end
+        else
+            local stashSlot = findTemporarySlot()
+            if not stashSlot then
+                failureReason = "no_empty_slot"
+                break
+            end
+            local moved = turtle.transferTo(stashSlot)
+            if not moved then
+                failureReason = "transfer_failed"
+                break
+            end
+            stashSlots[#stashSlots + 1] = stashSlot
+            cycled = cycled + 1
+            inventory.invalidate(ctx)
+            turtle.select(targetSlot)
         end
     end
-    rescanIfNeeded(ctx, opts)
-    return true
+
+    if success then
+        if cycled > 0 then
+            log(ctx, "debug", string.format("Pulled %s after cycling %d other stacks", material, cycled))
+        else
+            log(ctx, "debug", string.format("Pulled %s directly via turtle.suck", material))
+        end
+        returnStash(true)
+        restoreFacing()
+        rescanIfNeeded(ctx, opts)
+        return true
+    end
+
+    returnStash(true)
+    restoreFacing()
+    if failureReason then
+        log(ctx, "debug", string.format("Failed to pull %s after cycling %d stacks: %s", material, cycled, failureReason))
+    end
+    if failureReason == "suck_failed" then
+        return false, "missing_material"
+    end
+    return false, failureReason or "missing_material"
 end
 
 function inventory.clearSlot(ctx, slot, opts)
