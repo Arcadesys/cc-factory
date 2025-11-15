@@ -18,6 +18,8 @@ local DEFAULT_CONTEXT = {
         fuelThreshold = 80,
         fuelReserve = 160,
         fuelChestSides = { "forward", "down", "up" },
+        digOnMove = false,
+        attackOnMove = false,
     },
 }
 
@@ -152,7 +154,11 @@ local function run(ctxOverrides, ioOverrides)
     end)
 
     suite:step("Move turtle away from origin", function()
-        local ok, err = movement.goTo(ctx, { x = 2, y = 0, z = 1 }, { axisOrder = { "x", "z", "y" } })
+        local ok, err = movement.goTo(ctx, { x = 2, y = 0, z = 1 }, {
+            axisOrder = { "x", "z", "y" },
+            dig = false,
+            attack = false,
+        })
         if not ok then
             return false, err
         end

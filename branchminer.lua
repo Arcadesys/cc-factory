@@ -28,6 +28,7 @@ Options:
 	--branch-length <n>   Branch length in blocks (default 2)
 	--torch-interval <n>  Place torches every n segments (default 6)
 	--torch-item <id>     Item id for torches (default minecraft:torch)
+	--fuel-item <id>      Allowed fuel item (repeatable; defaults include coal/charcoal)
 	--no-torches          Disable torch placement
 	--min-fuel <n>        Minimum fuel level before refueling (default 180)
 	--facing <dir>        Initial/home facing (north|south|east|west)
@@ -44,6 +45,7 @@ local DEFAULT_OPTIONS = {
 	minFuel = 180,
 	facing = "north",
 	verbose = false,
+	fuelItems = nil,
 }
 
 local MOVE_OPTS = { dig = true, attack = true }
@@ -79,6 +81,23 @@ local DEFAULT_TRASH = {
 	["minecraft:lava"] = true,
 	["minecraft:water"] = true,
 	["minecraft:torch"] = true,
+}
+
+local TRASH_PLACEMENT_EXCLUDE = {
+	["minecraft:air"] = true,
+	["minecraft:bedrock"] = true,
+	["minecraft:lava"] = true,
+	["minecraft:torch"] = true,
+	["minecraft:water"] = true,
+}
+
+local DEFAULT_FUEL_ITEMS = {
+	"minecraft:coal",
+	"minecraft:charcoal",
+	"minecraft:coal_block",
+	"minecraft:lava_bucket",
+	"minecraft:blaze_rod",
+	"minecraft:dried_kelp_block",
 }
 
 local FACING_VECTORS = {
@@ -128,6 +147,14 @@ local function copyVector(vec)
 	return { x = vec.x or 0, y = vec.y or 0, z = vec.z or 0 }
 end
 
+local function positionsEqual(a, b)
+	a = a or {}
+	b = b or {}
+	return (a.x or 0) == (b.x or 0)
+		and (a.y or 0) == (b.y or 0)
+		and (a.z or 0) == (b.z or 0)
+end
+
 local function copyOptions(base, overrides)
 	local result = {}
 	for k, v in pairs(base) do
@@ -137,6 +164,31 @@ local function copyOptions(base, overrides)
 		result[k] = v
 	end
 	return result
+end
+
+local function expandFuelItems(custom)
+	if type(custom) ~= "table" or #custom == 0 then
+		return nil
+	end
+	local list = {}
+	local seen = {}
+	local function append(name)
+		if type(name) ~= "string" or name == "" then
+			return
+		end
+		if seen[name] then
+			return
+		end
+		seen[name] = true
+		list[#list + 1] = name
+	end
+	for _, name in ipairs(DEFAULT_FUEL_ITEMS) do
+		append(name)
+	end
+	for _, name in ipairs(custom) do
+		append(name)
+	end
+	return list
 end
 
 local function normaliseFacing(value)
@@ -185,6 +237,13 @@ local function parseArgs(argv)
 				opts.torchItem = value
 			end
 			i = i + 2
+		elseif arg == "--fuel-item" then
+			local value = argv[i + 1]
+			if value then
+				opts.fuelItems = opts.fuelItems or {}
+				opts.fuelItems[#opts.fuelItems + 1] = value
+			end
+			i = i + 2
 		elseif arg == "--no-torches" then
 			opts.torchInterval = 0
 			i = i + 1
@@ -223,7 +282,7 @@ BranchMiner.__index = BranchMiner
 local function buildTrashSet(extra)
 	local set = {}
 	for name, flag in pairs(DEFAULT_TRASH) do
-		set[name] = flag
+		set[name] = flag and true or false
 	end
 	if type(extra) == "table" then
 		for name, flag in pairs(extra) do
@@ -232,17 +291,28 @@ local function buildTrashSet(extra)
 			end
 		end
 	end
-	return set
+
+	local list = {}
+	for name, flag in pairs(set) do
+		if flag and not TRASH_PLACEMENT_EXCLUDE[name] then
+			list[#list + 1] = name
+		end
+	end
+	table.sort(list)
+	return set, list
 end
 
 function BranchMiner:new(opts)
 	local config = copyOptions(DEFAULT_OPTIONS, opts)
 	config.facing = normaliseFacing(config.facing)
+	config.fuelItems = expandFuelItems(config.fuelItems)
 
 	local logger = loggerLib.new({
 		level = config.verbose and "debug" or "info",
 		tag = "BranchMiner",
 	})
+
+	local trashSet, trashList = buildTrashSet()
 
 	local ctx = {
 		origin = { x = 0, y = 0, z = 0 },
@@ -255,6 +325,7 @@ function BranchMiner:new(opts)
 			attackOnMove = true,
 			maxMoveRetries = 12,
 			moveRetryDelay = 0.4,
+			fuelItems = config.fuelItems,
 		},
 		logger = logger,
 	}
@@ -268,13 +339,15 @@ function BranchMiner:new(opts)
 		ctx = ctx,
 		logger = logger,
 		options = config,
-		trash = buildTrashSet(),
+		trash = trashSet,
+		trashList = trashList,
 		torchEnabled = config.torchInterval and config.torchInterval > 0,
 		torchItem = config.torchItem,
 		stepCount = 0,
 		chestAvailable = false,
 		homeFacing = config.facing,
 		detectedValuables = {},
+		fuelItems = config.fuelItems,
 	}
 
 	return setmetatable(miner, BranchMiner)
@@ -285,6 +358,62 @@ function BranchMiner:isTrash(name)
 		return false
 	end
 	return self.trash[name] == true
+end
+
+function BranchMiner:selectTrashForPlacement()
+	if not turtle then
+		return false, "turtle API unavailable"
+	end
+	if type(self.trashList) ~= "table" then
+		return false, "no_trash_configured"
+	end
+	for _, name in ipairs(self.trashList) do
+		local ok = inventory.selectMaterial(self.ctx, name)
+		if ok then
+			local count = turtle.getItemCount and turtle.getItemCount() or 0
+			if count > 0 then
+				return true
+			end
+		end
+	end
+	return false, "no_trash_available"
+end
+
+function BranchMiner:placeTrash(direction)
+	if not turtle then
+		return false, "turtle API unavailable"
+	end
+	local selectOk, selectErr = self:selectTrashForPlacement()
+	if not selectOk then
+		return false, selectErr
+	end
+
+	local placeFn
+	if direction == "up" then
+		placeFn = turtle.placeUp
+	elseif direction == "down" then
+		placeFn = turtle.placeDown
+	else
+		placeFn = turtle.place
+	end
+
+	if type(placeFn) ~= "function" then
+		return false, "place_unavailable"
+	end
+
+	local ok, err = placeFn()
+	if not ok then
+		if err == "No block to place against" then
+			return false, "no_support"
+		end
+		if err == "Nothing to place" or err == "No items to place" then
+			return false, "no_trash_available"
+		end
+		return false, err or "place_failed"
+	end
+
+	inventory.invalidate(self.ctx)
+	return true
 end
 
 function BranchMiner:getDirectionFns(direction)
@@ -352,8 +481,7 @@ function BranchMiner:inspectAndMine(direction, opts)
 		if ok and type(data) == "table" then
 			hasBlock = true
 			detail = data
-			local offset = self:getOffsetForDirection(direction)
-			self:logValuableDetail(detail, direction, offset)
+			self:logValuableDetail(detail, direction)
 		end
 	end
 
@@ -422,10 +550,84 @@ function BranchMiner:logValuableDetail(detail, direction)
 	self.logger:info(string.format("Detected ore %s at %s", name, direction or "unknown"))
 end
 
-function BranchMiner:scanForValuables()
+local function warnBackfill(logger, label, err)
+	if not logger then
+		return
+	end
+	logger:warn(string.format("Backfill failed at %s: %s", label or "unknown", tostring(err or "unknown")))
+end
+
+function BranchMiner:harvestForward(label)
+	if not turtle or type(turtle.inspect) ~= "function" or type(turtle.dig) ~= "function" then
+		return true
+	end
+	local success, detail = turtle.inspect()
+	if not success or type(detail) ~= "table" then
+		return true
+	end
+	if not self:isValuableDetail(detail) then
+		return true
+	end
+	self:logValuableDetail(detail, label or "forward")
+	local digOk, digErr = turtle.dig()
+	if not digOk then
+		return false, digErr or "dig_failed_forward"
+	end
+	inventory.invalidate(self.ctx)
+	local placeOk, placeErr = self:placeTrash("forward")
+	if not placeOk then
+		warnBackfill(self.logger, label or "forward", placeErr)
+	end
+	return true
+end
+
+function BranchMiner:harvestVertical(direction)
 	if not turtle then
 		return true
 	end
+	local inspectFn
+	local digFn
+	local placeDir = direction
+	if direction == "up" then
+		inspectFn = turtle.inspectUp
+		digFn = turtle.digUp
+	elseif direction == "down" then
+		inspectFn = turtle.inspectDown
+		digFn = turtle.digDown
+	else
+		return false, "invalid_direction"
+	end
+	if type(inspectFn) ~= "function" or type(digFn) ~= "function" then
+		return true
+	end
+	local success, detail = inspectFn()
+	if not success or type(detail) ~= "table" then
+		return true
+	end
+	if not self:isValuableDetail(detail) then
+		return true
+	end
+	self:logValuableDetail(detail, direction)
+	local digOk, digErr = digFn()
+	if not digOk then
+		return false, digErr or string.format("dig_failed_%s", direction)
+	end
+	inventory.invalidate(self.ctx)
+	local placeOk, placeErr = self:placeTrash(placeDir)
+	if not placeOk then
+		warnBackfill(self.logger, direction, placeErr)
+	end
+	return true
+end
+
+function BranchMiner:scanForValuables(opts)
+	if not turtle then
+		return true
+	end
+
+	opts = opts or {}
+	local skipDown = opts.skipDown
+	local skipUp = opts.skipUp
 
 	local startFacing = movement.getFacing(self.ctx)
 
@@ -440,64 +642,70 @@ function BranchMiner:scanForValuables()
 		return true
 	end
 
-	local function inspectFn(fn)
-		if type(fn) ~= "function" then
-			return nil
-		end
-		local ok, success, data = pcall(fn)
-		if not ok or not success or type(data) ~= "table" then
-			return nil
-		end
-		return data
-	end
-
-	local detail = inspectFn(turtle.inspectUp)
-	if detail then
-		self:logValuableDetail(detail, "up")
-	end
-
-	detail = inspectFn(turtle.inspectDown)
-	if detail then
-		self:logValuableDetail(detail, "down")
-	end
-
-	detail = inspectFn(turtle.inspect)
-	if detail then
-		self:logValuableDetail(detail, "forward")
-	end
-
-	local function inspectHorizontal(turnFn, label)
-		local ok, err = turnFn()
+	if not skipUp then
+		local ok, err = self:harvestVertical("up")
 		if not ok then
-			restoreFacing()
 			return false, err
 		end
-		local horizontal = inspectFn(turtle.inspect)
-		if horizontal then
-			self:logValuableDetail(horizontal, label)
+	end
+
+	if not skipDown then
+		local ok, err = self:harvestVertical("down")
+		if not ok then
+			return false, err
 		end
-		local restoreOk, restoreErr = restoreFacing()
-		if not restoreOk then
-			return false, restoreErr
+	end
+
+	local ok, err = self:harvestForward("forward")
+	if not ok then
+		return false, err
+	end
+
+	local function harvestWithTurn(turnFn, undoFn, label)
+		local aligned, alignErr = restoreFacing()
+		if not aligned then
+			return false, alignErr
+		end
+		local turnOk, turnErr = turnFn()
+		if not turnOk then
+			return false, turnErr
+		end
+		local harvestOk, harvestErr = self:harvestForward(label)
+		local undoOk, undoErr = undoFn()
+		if not undoOk then
+			return false, undoErr
+		end
+		local faceOk, faceErr = restoreFacing()
+		if not faceOk then
+			return false, faceErr
+		end
+		if not harvestOk then
+			return false, harvestErr
 		end
 		return true
 	end
 
-	local ok, err = inspectHorizontal(function()
+	ok, err = harvestWithTurn(function()
 		return movement.turnLeft(self.ctx)
+	end, function()
+		return movement.turnRight(self.ctx)
 	end, "left")
 	if not ok then
 		return false, err
 	end
 
-	ok, err = inspectHorizontal(function()
+	ok, err = harvestWithTurn(function()
 		return movement.turnRight(self.ctx)
+	end, function()
+		return movement.turnLeft(self.ctx)
 	end, "right")
 	if not ok then
 		return false, err
 	end
 
-	ok, err = inspectHorizontal(function()
+	ok, err = harvestWithTurn(function()
+		return movement.turnAround(self.ctx)
+	end, function()
 		return movement.turnAround(self.ctx)
 	end, "back")
 	if not ok then
@@ -512,16 +720,44 @@ function BranchMiner:scanForValuables()
 	return true
 end
 
+function BranchMiner:harvestNearbyValuables()
+	local baseOk, baseErr = self:scanForValuables()
+	if not baseOk then
+		return false, baseErr
+	end
+
+	local upOk, upErr = movement.up(self.ctx, MOVE_OPTS)
+	if upOk then
+		local scanOk, scanErr = self:scanForValuables({ skipDown = true })
+		local downOk, downErr = movement.down(self.ctx, MOVE_OPTS)
+		if not downOk then
+			return false, downErr
+		end
+		if not scanOk then
+			return false, scanErr
+		end
+	else
+		if upErr and self.logger then
+			self.logger:debug("Upper scan skipped: " .. tostring(upErr))
+		end
+	end
+
+	return true
+end
+
 function BranchMiner:ensureFuel()
 	local ok, report = fuelLib.check(self.ctx, { threshold = self.options.minFuel })
-	if ok then
+	if ok or (report and report.unlimited) then
 		return true
 	end
-	if report and report.unlimited then
-		return true
-	end
+
+	local beforePos = movement.getPosition(self.ctx)
+	local beforeFacing = movement.getFacing(self.ctx)
 	self.logger:info("Fuel below threshold; attempting refuel")
-	local refueled, info = fuelLib.ensure(self.ctx, { threshold = self.options.minFuel })
+	local refueled, info = fuelLib.ensure(self.ctx, {
+		threshold = self.options.minFuel,
+		fuelItems = self.options.fuelItems,
+	})
 	if not refueled then
 		self.logger:error("Refuel failed; stopping")
 		if info and info.service and textutils and textutils.serialize then
@@ -529,6 +765,25 @@ function BranchMiner:ensureFuel()
 		end
 		return false, "refuel_failed"
 	end
+
+	local afterPos = movement.getPosition(self.ctx)
+	local afterFacing = movement.getFacing(self.ctx)
+	if not positionsEqual(beforePos, afterPos) or (beforeFacing and afterFacing and beforeFacing ~= afterFacing) then
+		self.logger:debug("Returning to work site after refuel")
+		local returnOk, returnErr = movement.goTo(self.ctx, beforePos, MOVE_OPTS)
+		if not returnOk then
+			self.logger:error("Failed to return after refuel: " .. tostring(returnErr))
+			return false, "post_refuel_return_failed"
+		end
+		if beforeFacing then
+			local faceOk, faceErr = movement.faceDirection(self.ctx, beforeFacing)
+			if not faceOk then
+				self.logger:error("Unable to restore facing after refuel: " .. tostring(faceErr))
+				return false, "post_refuel_face_failed"
+			end
+		end
+	end
+
 	return true
 end
 
@@ -878,7 +1133,26 @@ function BranchMiner:digBranch()
 			return false, err
 		end
 		self:inspectAndMine("up", { force = true })
-		self:scanBranchWalls()
+		local wallOk, wallErr = self:scanBranchWalls()
+		if not wallOk then
+			return false, wallErr
+		end
+
+		local upOk, upErr = movement.up(self.ctx, MOVE_OPTS)
+		if upOk then
+			local scanOk, scanErr = self:scanBranchWalls()
+			local downOk, downErr = movement.down(self.ctx, MOVE_OPTS)
+			if not downOk then
+				return false, downErr
+			end
+			if not scanOk then
+				return false, scanErr
+			end
+		else
+			if upErr and self.logger then
+				self.logger:debug("Upper branch scan skipped: " .. tostring(upErr))
+			end
+		end
 	end
 
 	self:inspectAndMine("forward", { force = false })
@@ -942,7 +1216,7 @@ function BranchMiner:advance()
 		end
 	end
 
-	local scanOk, scanErr = self:scanForValuables()
+	local scanOk, scanErr = self:harvestNearbyValuables()
 	if not scanOk then
 		return false, scanErr or "valuable_scan_failed"
 	end
@@ -959,7 +1233,7 @@ function BranchMiner:prepareStart()
 	if not ok then
 		return false, err
 	end
-	local scanOk, scanErr = self:scanForValuables()
+	local scanOk, scanErr = self:harvestNearbyValuables()
 	if not scanOk then
 		return false, scanErr
 	end

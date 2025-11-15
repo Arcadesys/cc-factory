@@ -1159,7 +1159,8 @@ function inventory.pullMaterial(ctx, material, amount, opts)
         if amount and amount > 0 then
             desired = math.min(amount, 64)
         else
-            desired = 64
+            -- Accept any positive stack when no explicit amount is requested.
+            desired = nil
         end
     elseif amount and amount > 0 then
         desired = amount
