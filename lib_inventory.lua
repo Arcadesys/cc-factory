@@ -871,6 +871,7 @@ function inventory.pullMaterial(ctx, material, amount, opts)
         return false, selectErr
     end
 
+    local periphSide = peripheralSideForDirection(side)
     local restoreFacing = noop
     if side == "forward" then
         local chestOk, restoreFn, searchErr = ensureChestAhead(ctx, opts)
@@ -881,6 +882,16 @@ function inventory.pullMaterial(ctx, material, amount, opts)
             restoreFacing = noop
         else
             restoreFacing = restoreFn
+        end
+    end
+
+    local transferred = 0
+    if material then
+        transferred = extractFromContainer(ctx, periphSide, material, amount, targetSlot)
+        if transferred > 0 then
+            restoreFacing()
+            rescanIfNeeded(ctx, opts)
+            return true
         end
     end
 
@@ -895,16 +906,27 @@ function inventory.pullMaterial(ctx, material, amount, opts)
     end
 
     restoreFacing()
-    rescanIfNeeded(ctx, opts)
     if material then
-        local hasMaterial, hasErr = inventory.hasMaterial(ctx, material, 1, { force = true })
-        if hasErr then
-            return true
-        end
-        if not hasMaterial then
-            log(ctx, "debug", string.format("Pulled from %s but expected material %s not found", side, material))
+        local detail = turtle.getItemDetail and turtle.getItemDetail(targetSlot) or nil
+        if not detail or detail.name ~= material then
+            if detail and detail.name then
+                log(ctx, "debug", string.format("Pulled %s while expecting %s; returning item", detail.name, material))
+            else
+                log(ctx, "debug", string.format("No %s received after pull; returning slot contents", material))
+            end
+            local pushOpts = { side = side }
+            if type(opts) == "table" and opts.searchAllSides ~= nil then
+                pushOpts.searchAllSides = opts.searchAllSides
+            end
+            local pushOk, pushErr = inventory.pushSlot(ctx, targetSlot, nil, pushOpts)
+            if not pushOk and pushErr then
+                log(ctx, "warn", string.format("Failed to return unexpected item to chest: %s", tostring(pushErr)))
+            end
+            rescanIfNeeded(ctx, opts)
+            return false, "wrong_material"
         end
     end
+    rescanIfNeeded(ctx, opts)
     return true
 end
 

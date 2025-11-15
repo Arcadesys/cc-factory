@@ -5,6 +5,8 @@ All public functions accept a shared ctx table and return success booleans
 with optional error messages.
 --]]
 
+---@diagnostic disable: undefined-global, undefined-field
+
 local movement = {}
 
 local CARDINALS = {"north", "east", "south", "west"}
@@ -312,6 +314,15 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
     end
 
     local maxRetries, allowDig, allowAttack, delay = getMoveConfig(ctx, opts)
+    if type(maxRetries) ~= "number" or maxRetries < 1 then
+        maxRetries = 1
+    else
+        maxRetries = math.floor(maxRetries)
+    end
+    if allowDig and maxRetries < 2 then
+        -- Ensure we attempt at least two dig cycles before giving up on movement.
+        maxRetries = 2
+    end
     local attempt = 0
 
     while attempt < maxRetries do
