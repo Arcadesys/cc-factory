@@ -1301,6 +1301,7 @@ function inventory.pullMaterial(ctx, material, amount, opts)
     local success = false
     local failureReason
     local cycled = 0
+    local assumedMatch = false
 
     while cycles < maxCycles do
         cycles = cycles + 1
@@ -1322,15 +1323,32 @@ function inventory.pullMaterial(ctx, material, amount, opts)
             break
         end
 
-        local detail = turtle.getItemDetail and turtle.getItemDetail(targetSlot) or nil
+        local detail
+        if turtle and turtle.getItemDetail then
+            detail = turtle.getItemDetail(targetSlot)
+            if detail == nil then
+                local okDetailed, detailed = pcall(turtle.getItemDetail, targetSlot, true)
+                if okDetailed then
+                    detail = detailed
+                end
+            end
+        end
         local updatedCount = turtle.getItemCount(targetSlot)
 
-        if detail and detail.name == material then
+        local assumedMatch = false
+        if not detail and material and updatedCount > 0 then
+            -- Non-advanced turtles cannot inspect stacks; assume the pulled stack
+            -- matches the requested material when we cannot obtain metadata.
+            assumedMatch = true
+        end
+
+        if (detail and detail.name == material) or assumedMatch then
             if not desired or updatedCount >= desired then
                 success = true
                 break
             end
         else
+            assumedMatch = false
             local stashSlot = findTemporarySlot()
             if not stashSlot then
                 failureReason = "no_empty_slot"
@@ -1349,7 +1367,9 @@ function inventory.pullMaterial(ctx, material, amount, opts)
     end
 
     if success then
-        if cycled > 0 then
+        if assumedMatch then
+            log(ctx, "debug", string.format("Pulled %s without detailed item metadata", material or "unknown"))
+        elseif cycled > 0 then
             log(ctx, "debug", string.format("Pulled %s after cycling %d other stacks", material, cycled))
         else
             log(ctx, "debug", string.format("Pulled %s directly via turtle.suck", material))
