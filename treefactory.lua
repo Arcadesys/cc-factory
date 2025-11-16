@@ -203,8 +203,11 @@ end
 
 -- Ensure the turtle exits the tree field via a safe walkway before heading home.
 local function retreatToFactoryHome(ctx)
-  local yLevel = (ctx.fieldOrigin and ctx.fieldOrigin.y) or 0
-  local targetRef = { x = ctx.walkwayEntranceX or 0, y = yLevel, z = 0 }
+  -- Use walkway entrance in reference coordinates (x = walkway offset, z = 0)
+  local world = ctx.world or {}
+  local walkwayOffset = (world.walkway and world.walkway.offset) or ctx.walkwayOffsetX or -1
+  local yLevel = (world.grid and world.grid.origin and world.grid.origin.y) or 0
+  local targetRef = { x = walkwayOffset, y = yLevel, z = 0 }
   local ok, err = worldstate.moveAlongWalkway(ctx, targetRef)
   if not ok then
     return false, err
@@ -254,20 +257,8 @@ local function advanceTraversal(ctx)
 end
 
 local function currentWalkPositionRef(ctx)
-  local ref = worldstate.currentWalkPositionRef(ctx)
-  if ref then
-    return ref
-  end
-  -- Fallback to legacy calculation if worldstate not yet configured
-  if not ctx.traverse then
-    resetTraversal(ctx)
-  end
-  local tr = ctx.traverse
-  return {
-    x = ctx.fieldOrigin.x + (tr.col - 1) * ctx.treeSpacingX,
-    y = ctx.fieldOrigin.y,
-    z = ctx.fieldOrigin.z + (tr.row - 1) * ctx.treeSpacingZ,
-  }
+  -- Always use worldstate's reference-frame aware calculation
+  return worldstate.currentWalkPositionRef(ctx)
 end
 
 local function currentWalkPosition(ctx)
@@ -276,22 +267,15 @@ local function currentWalkPosition(ctx)
 end
 
 local function currentTreePosition(ctx)
+  -- Always use offsetFromCell, which is in reference coordinates, then convert to world
   local treeRef = worldstate.offsetFromCell(ctx, { x = 1 })
-  if not treeRef then
-    local walkRef = currentWalkPositionRef(ctx)
-    treeRef = {
-      x = walkRef.x + 1,
-      y = walkRef.y,
-      z = walkRef.z,
-    }
-  end
   return referenceToWorld(ctx, treeRef)
 end
 
 -- Calculate which direction to face to look at the tree from current walkway position
 -- For a simple tree farm, trees are always to the east of the walkway
 local function getTreeFacing(ctx)
-  -- Trees are always 1 block east of walkway
+  -- Trees are always 1 block to the +X direction in reference frame
   return resolveFacing(ctx, "east")
 end
 
@@ -703,7 +687,7 @@ local function stateInitialize(ctx)
   })
   worldstate.configureNoDigBounds(ctx, FACTORY_BOUNDS)
   worldstate.configureWalkway(ctx, {
-    offset = 0,
+    offset = ctx.walkwayOffsetX,
     candidates = walkwayCandidates,
   })
   local fuelState = ensureFuelState(ctx)
@@ -936,6 +920,14 @@ local function statePlant(ctx)
   local ok = turtle.select(slot)
   if not ok then
     setError(ctx, "sapling slot select failed", STATE_PLANT)
+    return STATE_ERROR
+  end
+
+  -- Move to the correct tree planting position (reference-frame aware)
+  local treeRef = worldstate.offsetFromCell(ctx, { x = 1 })
+  ok, err = goToReference(ctx, treeRef, MOVE_OPTS_SOFT)
+  if not ok then
+    setError(ctx, err or "cannot move to tree cell", STATE_PLANT)
     return STATE_ERROR
   end
 
