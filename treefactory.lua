@@ -272,6 +272,13 @@ local function currentTreePosition(ctx)
   return referenceToWorld(ctx, treeRef)
 end
 
+-- Returns the reference position of the tree cell for the current traversal
+local function currentTreeCellRef(ctx)
+  -- The tree cell is always +1 in X from the walkway cell in reference frame
+  local walkRef = currentWalkPositionRef(ctx)
+  return { x = walkRef.x + 1, y = walkRef.y, z = walkRef.z }
+end
+
 -- Calculate which direction to face to look at the tree from current walkway position
 -- For a simple tree farm, trees are always to the east of the walkway
 local function getTreeFacing(ctx)
@@ -767,12 +774,11 @@ local function stateTraverse(ctx)
     tr = ctx.traverse
   end
 
-  local targetRef = currentWalkPositionRef(ctx)
-
-  -- Critical safety: traversal never digs, ever.
-  ok, err = worldstate.moveAlongWalkway(ctx, targetRef)
+  -- Move to the walkway cell for this tree
+  local walkRef = currentWalkPositionRef(ctx)
+  ok, err = worldstate.moveAlongWalkway(ctx, walkRef)
   if not ok then
-    setError(ctx, string.format("failed to reach farm tile: %s", err or "unknown"), STATE_TRAVERSE)
+    setError(ctx, string.format("failed to reach walkway: %s", err or "unknown"), STATE_TRAVERSE)
     return STATE_ERROR
   end
 
@@ -923,35 +929,15 @@ local function statePlant(ctx)
     return STATE_ERROR
   end
 
-  -- DEBUG: Print current walkway and tree cell positions
+  -- Move to the walkway cell for this tree
   local walkRef = currentWalkPositionRef(ctx)
-  local walkWorld = referenceToWorld(ctx, walkRef)
-  local treeRef = worldstate.offsetFromCell(ctx, { x = 1 })
-  local treeWorld = referenceToWorld(ctx, treeRef)
-  if ctx.logger then
-    if walkRef and walkWorld then
-      ctx.logger:info(string.format("Walkway ref: x=%s y=%s z=%s | world: x=%s y=%s z=%s",
-        tostring(walkRef.x), tostring(walkRef.y), tostring(walkRef.z),
-        tostring(walkWorld.x), tostring(walkWorld.y), tostring(walkWorld.z)))
-    else
-      ctx.logger:info("Walkway ref or world is nil")
-    end
-    if treeRef and treeWorld then
-      ctx.logger:info(string.format("Tree ref: x=%s y=%s z=%s | world: x=%s y=%s z=%s",
-        tostring(treeRef.x), tostring(treeRef.y), tostring(treeRef.z),
-        tostring(treeWorld.x), tostring(treeWorld.y), tostring(treeWorld.z)))
-    else
-      ctx.logger:info("Tree ref or world is nil")
-    end
-  end
-
-  -- Move to the correct tree planting position (reference-frame aware)
-  ok, err = goToReference(ctx, treeRef, MOVE_OPTS_SOFT)
+  ok, err = goToReference(ctx, walkRef, MOVE_OPTS_SOFT)
   if not ok then
-    setError(ctx, err or "cannot move to tree cell", STATE_PLANT)
+    setError(ctx, err or "cannot move to walkway cell", STATE_PLANT)
     return STATE_ERROR
   end
 
+  -- Face the tree cell (always +X in reference frame)
   local treeFacing = getTreeFacing(ctx)
   ok = movement.faceDirection(ctx, treeFacing)
   if not ok then
@@ -959,22 +945,30 @@ local function statePlant(ctx)
     return STATE_ERROR
   end
 
-  -- Check if there's an obstacle blocking sapling placement
-  local hasBlock, detail = turtle.inspect()
+  -- Check if there's an obstacle blocking sapling placement in the tree cell
+  local treeCellRef = currentTreeCellRef(ctx)
+  local treeCellWorld = referenceToWorld(ctx, treeCellRef)
+  local inspectFunc = turtle.inspect
+  if treeFacing == "up" then inspectFunc = turtle.inspectUp
+  elseif treeFacing == "down" then inspectFunc = turtle.inspectDown end
+  local hasBlock, detail = inspectFunc()
   if hasBlock then
     -- If there's a block, try to dig it (grass, dirt, etc.)
-    if not turtle.dig() then
+    local digFunc = turtle.dig
+    if treeFacing == "up" then digFunc = turtle.digUp
+    elseif treeFacing == "down" then digFunc = turtle.digDown end
+    if not digFunc() then
       setError(ctx, "cannot clear planting space", STATE_PLANT)
       return STATE_ERROR
     end
-    -- Give a moment for the block to clear
-    if sleep then
-      sleep(0.1)
-    end
+    if sleep then sleep(0.1) end
   end
 
-  -- Now try to place the sapling
-  if not turtle.place() then
+  -- Now try to place the sapling in front
+  local placeFunc = turtle.place
+  if treeFacing == "up" then placeFunc = turtle.placeUp
+  elseif treeFacing == "down" then placeFunc = turtle.placeDown end
+  if not placeFunc() then
     setError(ctx, "sapling placement failed", STATE_PLANT)
     return STATE_ERROR
   end
