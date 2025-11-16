@@ -100,6 +100,10 @@ local function ensureFuelState(ctx)
             state.sides = copyArray(DEFAULT_SIDES)
         end
     end
+    if type(state.cycleLimit) ~= "number" or state.cycleLimit <= 0 then
+        local cfgLimit = cfg.fuelCycleLimit or cfg.inventoryCycleLimit
+        state.cycleLimit = (cfgLimit and math.max(cfgLimit, 32)) or 192
+    end
     state.history = state.history or {}
     state.serviceActive = state.serviceActive or false
     state.lastLevel = state.lastLevel or nil
@@ -200,7 +204,11 @@ local function consumeFromInventory(ctx, target)
         if target > 0 and level >= target then
             break
         end
-        if turtle.select(slot) and turtle.getItemCount(slot) > 0 and turtle.refuel(0) then
+
+        turtle.select(slot)
+        local count = turtle.getItemCount(slot)
+        local canRefuel = count and count > 0 and turtle.refuel(0)
+        if canRefuel then
             while (target <= 0 or level < target) and turtle.getItemCount(slot) > 0 do
                 if not turtle.refuel(1) then
                     break
@@ -238,13 +246,18 @@ local function pullFromSources(ctx, state, opts)
     if maxAttempts < 1 then
         maxAttempts = #sides * #items
     end
+    local cycleLimit = (opts and opts.inventoryCycleLimit) or state.cycleLimit or 192
     for _, side in ipairs(sides) do
         for _, material in ipairs(items) do
             if attempts >= maxAttempts then
                 break
             end
             attempts = attempts + 1
-            local ok, err = inventory.pullMaterial(ctx, material, nil, { side = side, deferScan = true })
+            local ok, err = inventory.pullMaterial(ctx, material, nil, {
+                side = side,
+                deferScan = true,
+                cycleLimit = cycleLimit,
+            })
             if ok then
                 pulled[#pulled + 1] = { side = side, material = material }
                 log(ctx, "debug", string.format("Pulled %s from %s", material, side))
@@ -320,6 +333,27 @@ local function refuelInternal(ctx, state, opts)
             success = pulled,
             info = pullInfo,
         }
+
+        if pulled then
+            local consumedAfterPull, postInfo = consumeFromInventory(ctx, target)
+            report.steps[#report.steps + 1] = {
+                type = "inventory",
+                stage = "post_pull",
+                round = round,
+                success = consumedAfterPull,
+                info = postInfo,
+            }
+            if consumedAfterPull then
+                log(ctx, "debug", string.format("Post-pull consumption used %d fuel items", sumValues(postInfo and postInfo.consumed)))
+                local postLevel = select(1, readFuel())
+                if postLevel and postLevel >= target and target > 0 then
+                    report.finalLevel = postLevel
+                    report.reachedTarget = true
+                    return true, report
+                end
+            end
+        end
+
         if not pulled and not consumed then
             break
         end

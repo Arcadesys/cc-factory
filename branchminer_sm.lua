@@ -132,6 +132,8 @@ local ORE_NAME_HINTS = {
     "ancient_debris",
 }
 
+local MAX_VALUABLE_DIG_RETRIES = 3
+
 local STATE = {
     INITIALIZE = "INITIALIZE",
     CHECK_FUEL = "CHECK_FUEL",
@@ -554,6 +556,55 @@ logValuableDetail = function(ctx, detail, direction)
     logger:info(string.format("Detected ore %s at %s", name, direction or "unknown"))
 end
 
+local function safeInspectCall(inspectFn)
+    if type(inspectFn) ~= "function" then
+        return false
+    end
+    local ok, success, detail = pcall(inspectFn)
+    if not ok or not success or type(detail) ~= "table" then
+        return false
+    end
+    return true, detail
+end
+
+local function digValuableWithRetry(ctx, inspectFn, digFn, direction)
+    if type(digFn) ~= "function" then
+        return false, string.format("dig_unavailable_%s", direction or "unknown")
+    end
+
+    local attempts = 0
+    while true do
+        attempts = attempts + 1
+        local digOk, digErr = digFn()
+        if not digOk then
+            return false, digErr or string.format("dig_failed_%s", direction or "unknown")
+        end
+
+        inventory.invalidate(ctx)
+
+        local hasBlock, detail = safeInspectCall(inspectFn)
+        if not hasBlock or not isValuableDetail(ctx, detail) then
+            return true
+        end
+
+        if attempts >= MAX_VALUABLE_DIG_RETRIES then
+            local logger = getLogger(ctx)
+            if logger then
+                logger:warn(string.format(
+                    "Valuable persisted after %d dig attempts (%s)",
+                    attempts,
+                    direction or "unknown"
+                ))
+            end
+            return false, string.format("valuable_persist_%s", direction or "unknown")
+        end
+
+        if type(sleep) == "function" then
+            sleep(0)
+        end
+    end
+end
+
 local function warnBackfill(ctx, label, err)
     local logger = getLogger(ctx)
     if not logger then
@@ -566,19 +617,18 @@ local function harvestForward(ctx, label)
     if not turtle or type(turtle.inspect) ~= "function" or type(turtle.dig) ~= "function" then
         return true
     end
-    local success, detail = turtle.inspect()
-    if not success or type(detail) ~= "table" then
+    local inspected, detail = safeInspectCall(turtle.inspect)
+    if not inspected then
         return true
     end
     if not isValuableDetail(ctx, detail) then
         return true
     end
     logValuableDetail(ctx, detail, label or "forward")
-    local digOk, digErr = turtle.dig()
+    local digOk, digErr = digValuableWithRetry(ctx, turtle.inspect, turtle.dig, label or "forward")
     if not digOk then
-        return false, digErr or "dig_failed_forward"
+        return false, digErr
     end
-    inventory.invalidate(ctx)
     local placeOk, placeErr = placeTrash(ctx, "forward")
     if not placeOk then
         warnBackfill(ctx, label or "forward", placeErr)
@@ -605,19 +655,18 @@ local function harvestVertical(ctx, direction)
     if type(inspectFn) ~= "function" or type(digFn) ~= "function" then
         return true
     end
-    local success, detail = inspectFn()
-    if not success or type(detail) ~= "table" then
+    local inspected, detail = safeInspectCall(inspectFn)
+    if not inspected then
         return true
     end
     if not isValuableDetail(ctx, detail) then
         return true
     end
     logValuableDetail(ctx, detail, direction)
-    local digOk, digErr = digFn()
+    local digOk, digErr = digValuableWithRetry(ctx, inspectFn, digFn, direction)
     if not digOk then
-        return false, digErr or string.format("dig_failed_%s", direction)
+        return false, digErr
     end
-    inventory.invalidate(ctx)
     local placeOk, placeErr = placeTrash(ctx, placeDir)
     if not placeOk then
         warnBackfill(ctx, direction, placeErr)

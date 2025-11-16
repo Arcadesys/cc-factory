@@ -22,6 +22,80 @@ local AXIS_FACINGS = {
     z = { positive = "south", negative = "north" },
 }
 
+local DEFAULT_SOFT_BLOCKS = {
+    ["minecraft:snow"] = true,
+    ["minecraft:snow_layer"] = true,
+    ["minecraft:powder_snow"] = true,
+    ["minecraft:tall_grass"] = true,
+    ["minecraft:large_fern"] = true,
+    ["minecraft:grass"] = true,
+    ["minecraft:fern"] = true,
+    ["minecraft:cave_vines"] = true,
+    ["minecraft:cave_vines_plant"] = true,
+    ["minecraft:kelp"] = true,
+    ["minecraft:kelp_plant"] = true,
+    ["minecraft:sweet_berry_bush"] = true,
+}
+
+local DEFAULT_SOFT_TAGS = {
+    ["minecraft:snow"] = true,
+    ["minecraft:replaceable_plants"] = true,
+    ["minecraft:flowers"] = true,
+    ["minecraft:saplings"] = true,
+    ["minecraft:carpets"] = true,
+}
+
+local function cloneLookup(source)
+    local lookup = {}
+    for key, value in pairs(source) do
+        if value then
+            lookup[key] = true
+        end
+    end
+    return lookup
+end
+
+local function extendLookup(lookup, entries)
+    if type(entries) ~= "table" then
+        return lookup
+    end
+    if #entries > 0 then
+        for _, name in ipairs(entries) do
+            if type(name) == "string" then
+                lookup[name] = true
+            end
+        end
+    else
+        for name, enabled in pairs(entries) do
+            if enabled and type(name) == "string" then
+                lookup[name] = true
+            end
+        end
+    end
+    return lookup
+end
+
+local function isSoftBlock(state, inspectData)
+    if type(state) ~= "table" or type(inspectData) ~= "table" then
+        return false
+    end
+    local name = inspectData.name
+    if type(name) == "string" then
+        if state.softBlockLookup and state.softBlockLookup[name] then
+            return true
+        end
+    end
+    local tags = inspectData.tags
+    if type(tags) == "table" and state.softTagLookup then
+        for tag, value in pairs(tags) do
+            if value and state.softTagLookup[tag] then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function canonicalFacing(name)
     if type(name) ~= "string" then
         return nil
@@ -110,6 +184,7 @@ local function ensureMovementState(ctx)
 
     ctx.movement = ctx.movement or {}
     local state = ctx.movement
+    local cfg = ctx.config or {}
 
     if not state.position then
         if ctx.pointer then
@@ -122,16 +197,22 @@ local function ensureMovementState(ctx)
     end
 
     if not state.homeFacing then
-        local cfg = ctx.config or {}
         state.homeFacing = canonicalFacing(cfg.homeFacing) or canonicalFacing(cfg.initialFacing) or "north"
     end
 
     if not state.facing then
-        local cfg = ctx.config or {}
         state.facing = canonicalFacing(cfg.initialFacing) or state.homeFacing
     end
 
     state.position = copyPosition(state.position)
+
+    if not state.softBlockLookup then
+        state.softBlockLookup = extendLookup(cloneLookup(DEFAULT_SOFT_BLOCKS), cfg.movementSoftBlocks)
+    end
+    if not state.softTagLookup then
+        state.softTagLookup = extendLookup(cloneLookup(DEFAULT_SOFT_TAGS), cfg.movementSoftTags)
+    end
+    state.hasSoftClearRules = (next(state.softBlockLookup) ~= nil) or (next(state.softTagLookup) ~= nil)
 
     return state
 end
@@ -319,8 +400,8 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
     else
         maxRetries = math.floor(maxRetries)
     end
-    if allowDig and maxRetries < 2 then
-        -- Ensure we attempt at least two dig cycles before giving up on movement.
+    if (allowDig or state.hasSoftClearRules) and maxRetries < 2 then
+        -- Ensure we attempt at least two cycles whenever we might clear obstructions.
         maxRetries = 2
     end
     local attempt = 0
@@ -350,23 +431,40 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
             inspectData = tryInspect(moveFns.inspect)
         end
 
-        if blocked and allowDig and moveFns.dig then
-            local plannedMaterial = getPlannedMaterial(ctx, targetPos)
-            local canClear = true
+        if blocked and moveFns.dig then
+            local plannedMaterial
+            local canClear = false
+            local softBlock = inspectData and isSoftBlock(state, inspectData)
 
-            if plannedMaterial then
-                if inspectData and inspectData.name then
-                    if inspectData.name == plannedMaterial then
+            if softBlock then
+                canClear = true
+            elseif allowDig then
+                plannedMaterial = getPlannedMaterial(ctx, targetPos)
+                canClear = true
+
+                if plannedMaterial then
+                    if inspectData and inspectData.name then
+                        if inspectData.name == plannedMaterial then
+                            canClear = false
+                        end
+                    else
                         canClear = false
                     end
-                else
-                    canClear = false
                 end
             end
 
             if canClear and moveFns.dig() then
                 handled = true
-                if plannedMaterial then
+                if softBlock then
+                    local foundName = inspectData and inspectData.name or "unknown"
+                    log(ctx, "debug", string.format(
+                        "Cleared soft obstruction %s at x=%d y=%d z=%d",
+                        tostring(foundName),
+                        targetPos.x or 0,
+                        targetPos.y or 0,
+                        targetPos.z or 0
+                    ))
+                elseif plannedMaterial then
                     local foundName = inspectData and inspectData.name or "unknown"
                     log(ctx, "debug", string.format(
                         "Cleared mismatched block %s (expected %s) at x=%d y=%d z=%d",
@@ -395,7 +493,7 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
                         ))
                     end
                 end
-            elseif plannedMaterial and not canClear then
+            elseif plannedMaterial and not canClear and allowDig then
                 log(ctx, "debug", string.format(
                     "Preserving planned block %s at x=%d y=%d z=%d",
                     tostring(plannedMaterial),

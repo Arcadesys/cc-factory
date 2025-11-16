@@ -80,6 +80,37 @@ local function ensureOriginPose(ctx)
     return string.format("(x=%d, y=%d, z=%d, facing=%s)", pos.x, pos.y, pos.z, tostring(facing))
 end
 
+local function ensureOnboardFuel(ctx, io)
+    inventory.ensureState(ctx)
+    fuel.ensureState(ctx)
+
+    local function hasFuel()
+        local state = ctx.inventoryState or {}
+        local totals = state.materialTotals or {}
+        local fuelItems = (ctx.fuelState and ctx.fuelState.fuelItems) or {}
+        for _, name in ipairs(fuelItems) do
+            if (totals[name] or 0) > 0 then
+                return true
+            end
+        end
+        return false
+    end
+
+    inventory.scan(ctx)
+    if hasFuel() then
+        return true
+    end
+
+    if io.print then
+        io.print("No onboard fuel detected. Place at least one recognized fuel item in the turtle's inventory.")
+    end
+    common.promptEnter(io, "Press Enter after placing onboard fuel.")
+
+    inventory.invalidate(ctx)
+    inventory.scan(ctx)
+    return hasFuel()
+end
+
 local function run(ctxOverrides, ioOverrides)
     if not turtle then
         error("Run this harness on a turtle.")
@@ -165,6 +196,39 @@ local function run(ctxOverrides, ioOverrides)
         if io.print then
             io.print("Turtle moved to " .. ensureOriginPose(ctx))
         end
+        return true
+    end)
+
+    suite:step("Refuel using onboard items away from chest", function()
+        local pos = movement.getPosition(ctx)
+        if pos.x == ctx.origin.x and pos.y == ctx.origin.y and pos.z == ctx.origin.z then
+            return false, "turtle_not_away_from_origin"
+        end
+
+        if not ensureOnboardFuel(ctx, io) then
+            return false, "no_onboard_fuel"
+        end
+
+        local _, before = fuel.check(ctx, {})
+        local startLevel = before.level or 0
+        local increment = math.max(10, (ctx.fuelState and ctx.fuelState.threshold or 80) / 4)
+        local target = startLevel + math.floor(increment)
+
+        if io.print then
+            io.print(string.format("Attempting onboard refuel to reach at least %d fuel.", target))
+        end
+
+        local ok, report = fuel.refuel(ctx, { target = target, rounds = 1 })
+        if io.print then
+            io.print(string.format("Onboard refuel %s (final=%s)", ok and "succeeded" or "failed", tostring(report.finalLevel or "unknown")))
+        end
+
+        if not ok then
+            return false, report
+        end
+
+        local _, after = fuel.check(ctx, {})
+        describeFuel(io, after)
         return true
     end)
 
