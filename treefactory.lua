@@ -11,6 +11,7 @@ local inventory = require("lib_inventory")
 local placement = require("lib_placement")
 local loggerLib = require("lib_logger")
 local fuelLib = require("lib_fuel")
+local worldstate = require("lib_worldstate")
 
 local STATE_INITIALIZE = "INITIALIZE"
 local STATE_BUILD_FACTORY = "BUILD_FACTORY"
@@ -28,10 +29,37 @@ local STATE_DEPOSIT = "DEPOSIT"
 local STATE_SLEEP = "SLEEP"
 local STATE_ERROR = "ERROR"
 
-local MOVE_OPTS_CLEAR = { dig = true, attack = true }
-local MOVE_OPTS_SOFT = { dig = false, attack = false }
-local MOVE_OPTS_FACTORY = { dig = true, attack = true }
-local MOVE_AXIS_FALLBACK = { "z", "x", "y" }
+local MOVE_OPTS_CLEAR = worldstate.MOVE_OPTS_CLEAR
+local MOVE_OPTS_SOFT = worldstate.MOVE_OPTS_SOFT
+local MOVE_OPTS_FACTORY = MOVE_OPTS_CLEAR
+
+local function buildReferenceFrame(ctx)
+  return worldstate.buildReferenceFrame(ctx, {
+    homeFacing = ctx.config and ctx.config.homeFacing,
+    initialFacing = ctx.config and ctx.config.initialFacing,
+    referenceFacing = "east",
+  })
+end
+
+local function referenceToWorld(ctx, refPos)
+  return worldstate.referenceToWorld(ctx, refPos)
+end
+
+local function worldToReference(ctx, worldPos)
+  return worldstate.worldToReference(ctx, worldPos)
+end
+
+local function resolveFacing(ctx, facing)
+  return worldstate.resolveFacing(ctx, facing)
+end
+
+local function goToReference(ctx, refPos, moveOpts)
+  return worldstate.goToReference(ctx, refPos, moveOpts)
+end
+
+local function goAndFaceReference(ctx, refPos, facing, moveOpts)
+  return worldstate.goAndFaceReference(ctx, refPos, facing, moveOpts)
+end
 
 -- Bounding box around the factory where we must never dig
 local FACTORY_BOUNDS = {
@@ -147,62 +175,10 @@ local function cloneTable(source)
   return copy
 end
 
-local function mergeMoveOpts(baseOpts, extraOpts)
-  if not extraOpts then
-    if not baseOpts then
-      return nil
-    end
-    return cloneTable(baseOpts)
-  end
-
-  local merged = {}
-  if baseOpts then
-    for key, value in pairs(baseOpts) do
-      merged[key] = value
-    end
-  end
-  for key, value in pairs(extraOpts) do
-    merged[key] = value
-  end
-  return merged
-end
-
 -- Choose movement options based on a position: inside the factory footprint we
 -- never dig, outside we allow clearing. This keeps placed chests/furnace safe.
-local function moveOptsForPosition(pos)
-  if not pos then
-    return MOVE_OPTS_CLEAR
-  end
-  local x = pos.x or 0
-  local z = pos.z or 0
-  -- Hard no-dig rectangle covering the factory footprint around origin.
-  if x >= -2 and x <= 2 and z >= -3 and z <= 3 then
-    return MOVE_OPTS_SOFT
-  end
-  return MOVE_OPTS_CLEAR
-end
-
-local function goToWithFallback(ctx, position, moveOpts)
-  local ok, err = movement.goTo(ctx, position, moveOpts)
-  if ok or (moveOpts and moveOpts.axisOrder) then
-    return ok, err
-  end
-  local fallbackOpts = mergeMoveOpts(moveOpts, { axisOrder = MOVE_AXIS_FALLBACK })
-  return movement.goTo(ctx, position, fallbackOpts)
-end
-
-local function goAndFace(ctx, position, facing, moveOpts)
-  local ok, err = goToWithFallback(ctx, position, moveOpts or MOVE_OPTS_FACTORY)
-  if not ok then
-    return false, err
-  end
-  if facing then
-    ok, err = movement.faceDirection(ctx, facing)
-    if not ok then
-      return false, err
-    end
-  end
-  return true
+local function moveOptsForPosition(ctx, pos)
+  return worldstate.moveOptsForPosition(ctx, pos)
 end
 
 local function isInsideFactoryBounds(pos)
@@ -214,27 +190,11 @@ local function isInsideFactoryBounds(pos)
     and z >= FACTORY_BOUNDS.minZ and z <= FACTORY_BOUNDS.maxZ
 end
 
--- Calculate which direction to face to look at the tree from current walkway position
-local function getTreeFacing(ctx)
-  local walk = currentWalkPosition(ctx)
-  local tree = currentTreePosition(ctx)
-  
-  local dx = tree.x - walk.x
-  local dz = tree.z - walk.z
-  
-  -- Determine primary direction based on largest offset
-  if math.abs(dx) > math.abs(dz) then
-    return dx > 0 and "east" or "west"
-  else
-    return dz > 0 and "south" or "north"
-  end
-end
-
 -- Move softly from current position to a fixed "safe" point outside the factory box.
 -- This never digs, so placed chests/furnace cannot be broken.
 local function moveSoftOutOfFactory(ctx)
-  local safe = { x = 3, y = 0, z = -4 }
-  local ok, err = goToWithFallback(ctx, safe, MOVE_OPTS_SOFT)
+  local safeRef = { x = 3, y = 0, z = -4 }
+  local ok, err = goToReference(ctx, safeRef, MOVE_OPTS_SOFT)
   if not ok then
     return false, err or "failed_soft_escape"
   end
@@ -244,31 +204,17 @@ end
 -- Ensure the turtle exits the tree field via a safe walkway before heading home.
 local function retreatToFactoryHome(ctx)
   local yLevel = (ctx.fieldOrigin and ctx.fieldOrigin.y) or 0
-  local targetZ = (ctx.origin and ctx.origin.z) or 0
-
-  if ctx.currentZ ~= targetZ then
-    local ok, err = moveToAvailableWalkway(ctx, yLevel, targetZ)
-    if not ok then
-      return false, err
-    end
-  end
-
-  local safeX = ctx.walkwayEntranceX or (ctx.origin and ctx.origin.x) or 0
-  if ctx.currentX ~= safeX then
-    local ok, err = goToWithFallback(ctx, { x = safeX, y = yLevel, z = targetZ }, MOVE_OPTS_SOFT)
-    if not ok then
-      return false, err
-    end
-    ctx.currentX = safeX
-  end
-
-  local ok, err = returnHome(ctx)
+  local targetRef = { x = ctx.walkwayEntranceX or 0, y = yLevel, z = 0 }
+  local ok, err = worldstate.moveAlongWalkway(ctx, targetRef)
   if not ok then
     return false, err
   end
 
-  ctx.currentX = ctx.origin and ctx.origin.x or 0
-  ctx.currentZ = ctx.origin and ctx.origin.z or 0
+  ok, err = worldstate.returnHome(ctx, MOVE_OPTS_SOFT)
+  if not ok then
+    return false, err
+  end
+
   return true
 end
 
@@ -286,18 +232,7 @@ local function logStateTransition(ctx, fromState, toState, note)
 end
 
 local function returnHome(ctx)
-  local ok, err = goToWithFallback(ctx, ctx.origin, MOVE_OPTS_SOFT)
-  if not ok then
-    return false, err
-  end
-  local facing = ctx.config.homeFacing or ctx.config.initialFacing or "east"
-  ok, err = movement.faceDirection(ctx, facing)
-  if not ok then
-    return false, err
-  end
-  ctx.currentX = 0
-  ctx.currentZ = 0
-  return true
+  return worldstate.returnHome(ctx, MOVE_OPTS_SOFT)
 end
 
 local function setError(ctx, message, returnState)
@@ -310,53 +245,24 @@ local function setError(ctx, message, returnState)
 end
 
 local function resetTraversal(ctx)
-  ctx.traverse = {
-    row = 1,
-    col = 1,
-    forward = true,
-    done = false,
-  }
+  ctx.traverse = worldstate.resetTraversal(ctx)
 end
 
 local function advanceTraversal(ctx)
-  local tr = ctx.traverse
-  if not tr then
-    resetTraversal(ctx)
-    tr = ctx.traverse
-  end
-
-  if tr.done then
-    return
-  end
-
-  if tr.forward then
-    if tr.col < ctx.gridWidth then
-      tr.col = tr.col + 1
-      return
-    end
-    tr.forward = false
-  else
-    if tr.col > 1 then
-      tr.col = tr.col - 1
-      return
-    end
-    tr.forward = true
-  end
-
-  tr.row = tr.row + 1
-  if tr.row > ctx.gridLength then
-    tr.done = true
-  else
-    tr.col = tr.forward and 1 or ctx.gridWidth
-  end
+  local tr = worldstate.advanceTraversal(ctx)
+  ctx.traverse = tr
 end
 
-local function currentWalkPosition(ctx)
-  local tr = ctx.traverse
-  if not tr then
-    resetTraversal(ctx)
-    tr = ctx.traverse
+local function currentWalkPositionRef(ctx)
+  local ref = worldstate.currentWalkPositionRef(ctx)
+  if ref then
+    return ref
   end
+  -- Fallback to legacy calculation if worldstate not yet configured
+  if not ctx.traverse then
+    resetTraversal(ctx)
+  end
+  local tr = ctx.traverse
   return {
     x = ctx.fieldOrigin.x + (tr.col - 1) * ctx.treeSpacingX,
     y = ctx.fieldOrigin.y,
@@ -364,13 +270,29 @@ local function currentWalkPosition(ctx)
   }
 end
 
+local function currentWalkPosition(ctx)
+  local ref = currentWalkPositionRef(ctx)
+  return referenceToWorld(ctx, ref)
+end
+
 local function currentTreePosition(ctx)
-  local walk = currentWalkPosition(ctx)
-  return {
-    x = walk.x,
-    y = walk.y,
-    z = walk.z + 1,
-  }
+  local treeRef = worldstate.offsetFromCell(ctx, { x = 1 })
+  if not treeRef then
+    local walkRef = currentWalkPositionRef(ctx)
+    treeRef = {
+      x = walkRef.x + 1,
+      y = walkRef.y,
+      z = walkRef.z,
+    }
+  end
+  return referenceToWorld(ctx, treeRef)
+end
+
+-- Calculate which direction to face to look at the tree from current walkway position
+-- For a simple tree farm, trees are always to the east of the walkway
+local function getTreeFacing(ctx)
+  -- Trees are always 1 block east of walkway
+  return resolveFacing(ctx, "east")
 end
 
 local function insertUnique(tbl, value)
@@ -386,129 +308,17 @@ local function insertUnique(tbl, value)
 end
 
 local function buildWalkwayCandidates(ctx)
-  ctx.walkwayCandidates = {}
-  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x + ctx.walkwayOffsetX)
-  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x - ctx.treeSpacingX)
-  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x + ctx.treeSpacingX)
-  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x + (ctx.gridWidth * ctx.treeSpacingX))
-  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x)
-  insertUnique(ctx.walkwayCandidates, ctx.origin.x)
+  local candidates = {}
+  insertUnique(candidates, ctx.fieldOrigin.x + ctx.walkwayOffsetX)
+  insertUnique(candidates, ctx.fieldOrigin.x - ctx.treeSpacingX)
+  insertUnique(candidates, ctx.fieldOrigin.x + ctx.treeSpacingX)
+  insertUnique(candidates, ctx.fieldOrigin.x + (ctx.gridWidth * ctx.treeSpacingX))
+  insertUnique(candidates, ctx.fieldOrigin.x)
+  insertUnique(candidates, ctx.origin.x)
+  ctx.walkwayCandidates = candidates
+  return candidates
 end
 
-local function isTreeColumnX(ctx, testX)
-  if not ctx or not ctx.fieldOrigin or testX == nil then
-    return false
-  end
-  local spacing = ctx.treeSpacingX or 1
-  local gridWidth = ctx.gridWidth or 0
-  local baseX = ctx.fieldOrigin.x or 0
-  for offset = 0, math.max(gridWidth - 1, 0) do
-    local treeX = baseX + offset * spacing
-    if treeX == testX then
-      return true
-    end
-  end
-  return false
-end
-
-local function ensureWalkwayAvailability(ctx)
-  local candidates = ctx.walkwayCandidates or {}
-  local safe = {}
-  local selected
-
-  for _, candidate in ipairs(candidates) do
-    if candidate ~= nil and not isTreeColumnX(ctx, candidate) then
-      insertUnique(safe, candidate)
-      selected = selected or candidate
-    end
-  end
-
-  if not selected then
-    local spacing = ctx.treeSpacingX or 1
-    local gridWidth = ctx.gridWidth or 1
-    local baseX = ctx.fieldOrigin and ctx.fieldOrigin.x or 0
-    local maxX = baseX + math.max(gridWidth - 1, 0) * spacing
-    local fallback = maxX + spacing
-    insertUnique(safe, fallback)
-    selected = fallback
-  end
-
-  ctx.walkwayCandidates = safe
-  ctx.walkwayEntranceX = selected or ctx.origin.x or 0
-end
-
-local function moveToAvailableWalkway(ctx, yLevel, targetZ)
-  local candidates = ctx.walkwayCandidates or { ctx.walkwayEntranceX }
-  local lastErr
-  for _, safeX in ipairs(candidates) do
-    if safeX then
-      local ok, err
-      if ctx.currentX ~= safeX then
-        ok, err = goToWithFallback(ctx, { x = safeX, y = yLevel, z = ctx.currentZ }, MOVE_OPTS_SOFT)
-        if not ok then
-          lastErr = err
-          goto next_candidate
-        end
-        ctx.currentX = safeX
-      end
-
-      if ctx.currentZ ~= targetZ then
-        ok, err = goToWithFallback(ctx, { x = safeX, y = yLevel, z = targetZ }, MOVE_OPTS_SOFT)
-        if not ok then
-          lastErr = err
-          goto next_candidate
-        end
-        ctx.currentZ = targetZ
-      end
-
-      ctx.walkwayEntranceX = safeX
-      return true
-    end
-    ::next_candidate::
-  end
-  return false, lastErr or "walkway_blocked"
-end
-
-local function moveAlongWalkway(ctx, target)
-  if not ctx or not target then
-    return false, "invalid_target"
-  end
-
-  if ctx.currentX == nil or ctx.currentZ == nil then
-    local ok, err = goToWithFallback(ctx, target, MOVE_OPTS_SOFT)
-    if ok then
-      ctx.currentX = target.x
-      ctx.currentZ = target.z
-    end
-    return ok, err
-  end
-
-  local currentY = target.y or ctx.fieldOrigin.y or 0
-  if ctx.currentZ ~= target.z then
-    local ok, err = moveToAvailableWalkway(ctx, currentY, target.z)
-    if not ok then
-      return false, err
-    end
-  end
-
-  if ctx.currentX ~= target.x then
-    local ok, err = goToWithFallback(ctx, { x = target.x, y = currentY, z = ctx.currentZ }, MOVE_OPTS_SOFT)
-    if not ok then
-      return false, err
-    end
-    ctx.currentX = target.x
-  end
-
-  if ctx.currentZ ~= target.z then
-    local ok, err = goToWithFallback(ctx, target, MOVE_OPTS_SOFT)
-    if not ok then
-      return false, err
-    end
-    ctx.currentZ = target.z
-  end
-
-  return true
-end
 
 local function isLogBlock(ctx, detail)
   if type(detail) ~= "table" then
@@ -563,7 +373,7 @@ local function placeFactoryBlock(ctx, key)
   end
 
   -- Use soft movement so we never dig through previously-placed factory blocks
-  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
+  local ok, err = goAndFaceReference(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
   if not ok then
     return false, err
   end
@@ -584,7 +394,7 @@ local function verifyFactoryBlock(ctx, key)
     return false, "missing_factory_definition"
   end
 
-  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
+  local ok, err = goAndFaceReference(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
   if not ok then
     return false, err
   end
@@ -663,7 +473,7 @@ local function refuelIfNeeded(ctx)
 end
 
 local function moveAboveFurnace(ctx)
-  local ok, err = goAndFace(ctx, ctx.origin, "north", MOVE_OPTS_SOFT)
+  local ok, err = goAndFaceReference(ctx, { x = 0, y = 0, z = 0 }, "north", MOVE_OPTS_SOFT)
   if not ok then
     return false, err
   end
@@ -700,7 +510,7 @@ local function leaveAboveFurnace(ctx)
 end
 
 local function moveToFurnaceFuelSide(ctx)
-  local ok, err = goAndFace(ctx, { x = 1, y = 0, z = 0 }, "north", MOVE_OPTS_SOFT)
+  local ok, err = goAndFaceReference(ctx, { x = 1, y = 0, z = 0 }, "north", MOVE_OPTS_SOFT)
   if not ok then
     return false, err
   end
@@ -708,7 +518,7 @@ local function moveToFurnaceFuelSide(ctx)
   if not ok then
     return false, err
   end
-  ok, err = movement.faceDirection(ctx, "west")
+  ok, err = movement.faceDirection(ctx, resolveFacing(ctx, "west"))
   if not ok then
     return false, err
   end
@@ -716,7 +526,7 @@ local function moveToFurnaceFuelSide(ctx)
 end
 
 local function leaveFurnaceFuelSide(ctx)
-  local ok, err = movement.faceDirection(ctx, "south")
+  local ok, err = movement.faceDirection(ctx, resolveFacing(ctx, "south"))
   if not ok then
     return false, err
   end
@@ -724,7 +534,7 @@ local function leaveFurnaceFuelSide(ctx)
   if not ok then
     return false, err
   end
-  ok, err = movement.faceDirection(ctx, "west")
+  ok, err = movement.faceDirection(ctx, resolveFacing(ctx, "west"))
   if not ok then
     return false, err
   end
@@ -753,7 +563,7 @@ local function depositToChest(ctx, key, material, keepCount)
   local toDrop = total - keepCount
 
   local approach = FACTORY_APPROACH[key]
-  ok = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
+  ok = goAndFaceReference(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
   if not ok then
     return false, "move_failed"
   end
@@ -785,7 +595,7 @@ local function restockFromChest(ctx, chestKey, material, slot, amount)
     return false, "unknown_chest"
   end
 
-  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
+  local ok, err = goAndFaceReference(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
   if not ok then
     return false, err
   end
@@ -866,16 +676,13 @@ local function stateInitialize(ctx)
   ctx.logBuffer = ctx.logBuffer or 0
   ctx.charcoalBuffer = ctx.charcoalBuffer or 0
   ctx.origin = { x = 0, y = 0, z = 0 }
-  ctx.currentX = 0
-  ctx.currentZ = 0
   ctx.fieldOrigin = { x = 1, y = 0, z = -ctx.gridLength * ctx.treeSpacingZ }
   ctx.walkwayOffsetX = ctx.config.walkwayOffsetX
   if ctx.walkwayOffsetX == nil then
     ctx.walkwayOffsetX = -ctx.treeSpacingX
   end
   ctx.walkwayEntranceX = ctx.fieldOrigin.x + ctx.walkwayOffsetX
-  buildWalkwayCandidates(ctx)
-  ensureWalkwayAvailability(ctx)
+  local walkwayCandidates = buildWalkwayCandidates(ctx)
   ctx.factory = ctx.factory or {}
   ctx.factory.furnaceSlot = ctx.config.factorySlots.furnace
   ctx.factory.outputChestSlot = ctx.config.factorySlots.outputChest
@@ -886,6 +693,19 @@ local function stateInitialize(ctx)
   movement.ensureState(ctx)
   movement.setPosition(ctx, ctx.origin)
   movement.setFacing(ctx, ctx.config.initialFacing or "east")
+  buildReferenceFrame(ctx)
+  worldstate.configureGrid(ctx, {
+    width = ctx.gridWidth,
+    length = ctx.gridLength,
+    spacingX = ctx.treeSpacingX,
+    spacingZ = ctx.treeSpacingZ,
+    origin = ctx.fieldOrigin,
+  })
+  worldstate.configureNoDigBounds(ctx, FACTORY_BOUNDS)
+  worldstate.configureWalkway(ctx, {
+    offset = 0,
+    candidates = walkwayCandidates,
+  })
   local fuelState = ensureFuelState(ctx)
   if ctx.logger and fuelState and turtle and turtle.getFuelLevel then
     local level = turtle.getFuelLevel()
@@ -963,10 +783,10 @@ local function stateTraverse(ctx)
     tr = ctx.traverse
   end
 
-  local target = currentWalkPosition(ctx)
+  local targetRef = currentWalkPositionRef(ctx)
 
   -- Critical safety: traversal never digs, ever.
-  ok, err = moveAlongWalkway(ctx, target)
+  ok, err = worldstate.moveAlongWalkway(ctx, targetRef)
   if not ok then
     setError(ctx, string.format("failed to reach farm tile: %s", err or "unknown"), STATE_TRAVERSE)
     return STATE_ERROR
@@ -1019,11 +839,6 @@ local function stateChop(ctx)
     return STATE_ERROR
   end
 
-  -- Save the walking path position before entering tree
-  local walkX = ctx.currentX
-  local walkZ = ctx.currentZ
-  local walkTarget = { x = walkX, y = 0, z = walkZ }
-
   ensureInventory(ctx)
   local before = inventory.countMaterial(ctx, ctx.config.logMaterial, { force = true }) or 0
 
@@ -1058,24 +873,25 @@ local function stateChop(ctx)
     ascended = ascended - 1
   end
 
-  -- Return to the walking path position explicitly
-  ok, err = goToWithFallback(ctx, walkTarget, MOVE_OPTS_SOFT)
+  -- Turn around and go back to the walkway
+  ok, err = movement.turnAround(ctx)
   if not ok then
-    setError(ctx, string.format("failed returning to path: %s", err or "unknown"), STATE_CHOP)
+    setError(ctx, err or "failed turning around", STATE_CHOP)
     return STATE_ERROR
   end
-
-  -- Face back toward the tree position (recalculate in case we're on a different cell)
-  treeFacing = getTreeFacing(ctx)
-  ok, err = movement.faceDirection(ctx, treeFacing)
+  
+  ok, err = movement.forward(ctx, MOVE_OPTS_SOFT)
   if not ok then
-    setError(ctx, err or "turnaround failed", STATE_CHOP)
+    setError(ctx, err or "failed returning to walkway", STATE_CHOP)
     return STATE_ERROR
   end
-
-  -- Restore the saved position
-  ctx.currentX = walkX
-  ctx.currentZ = walkZ
+  
+  -- Turn back to face the tree
+  ok, err = movement.turnAround(ctx)
+  if not ok then
+    setError(ctx, err or "failed facing tree again", STATE_CHOP)
+    return STATE_ERROR
+  end
 
   collectNearbyDrops(ctx)
 
@@ -1123,12 +939,28 @@ local function statePlant(ctx)
     return STATE_ERROR
   end
 
-  ok = movement.faceDirection(ctx, ctx.treeFacing)
+  local treeFacing = getTreeFacing(ctx)
+  ok = movement.faceDirection(ctx, treeFacing)
   if not ok then
     setError(ctx, "cannot face tree", STATE_PLANT)
     return STATE_ERROR
   end
 
+  -- Check if there's an obstacle blocking sapling placement
+  local hasBlock, detail = turtle.inspect()
+  if hasBlock then
+    -- If there's a block, try to dig it (grass, dirt, etc.)
+    if not turtle.dig() then
+      setError(ctx, "cannot clear planting space", STATE_PLANT)
+      return STATE_ERROR
+    end
+    -- Give a moment for the block to clear
+    if sleep then
+      sleep(0.1)
+    end
+  end
+
+  -- Now try to place the sapling
   if not turtle.place() then
     setError(ctx, "sapling placement failed", STATE_PLANT)
     return STATE_ERROR
@@ -1210,7 +1042,7 @@ local function stateSmelt(ctx)
   end
 
   returnHome(ctx)
-  movement.faceDirection(ctx, "north")
+  movement.faceDirection(ctx, resolveFacing(ctx, "north"))
   if sleep then
     sleep(ctx.config.furnaceWait or 8)
   end
