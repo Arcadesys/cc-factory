@@ -45,6 +45,12 @@ local DEFAULT_SOFT_TAGS = {
     ["minecraft:carpets"] = true,
 }
 
+local DEFAULT_SOFT_NAME_HINTS = {
+    "sapling",
+    "propagule",
+    "seedling",
+}
+
 local function cloneLookup(source)
     local lookup = {}
     for key, value in pairs(source) do
@@ -75,6 +81,58 @@ local function extendLookup(lookup, entries)
     return lookup
 end
 
+local function buildSoftNameHintList(configHints)
+    local seen = {}
+    local list = {}
+
+    local function append(value)
+        if type(value) ~= "string" then
+            return
+        end
+        local normalized = value:lower()
+        if normalized == "" or seen[normalized] then
+            return
+        end
+        seen[normalized] = true
+        list[#list + 1] = normalized
+    end
+
+    for _, hint in ipairs(DEFAULT_SOFT_NAME_HINTS) do
+        append(hint)
+    end
+
+    if type(configHints) == "table" then
+        if #configHints > 0 then
+            for _, entry in ipairs(configHints) do
+                append(entry)
+            end
+        else
+            for name, enabled in pairs(configHints) do
+                if enabled then
+                    append(name)
+                end
+            end
+        end
+    elseif type(configHints) == "string" then
+        append(configHints)
+    end
+
+    return list
+end
+
+local function matchesSoftNameHint(hints, blockName)
+    if type(blockName) ~= "string" then
+        return false
+    end
+    local lowered = blockName:lower()
+    for _, hint in ipairs(hints or {}) do
+        if lowered:find(hint, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
 local function isSoftBlock(state, inspectData)
     if type(state) ~= "table" or type(inspectData) ~= "table" then
         return false
@@ -82,6 +140,9 @@ local function isSoftBlock(state, inspectData)
     local name = inspectData.name
     if type(name) == "string" then
         if state.softBlockLookup and state.softBlockLookup[name] then
+            return true
+        end
+        if matchesSoftNameHint(state.softNameHints, name) then
             return true
         end
     end
@@ -212,7 +273,12 @@ local function ensureMovementState(ctx)
     if not state.softTagLookup then
         state.softTagLookup = extendLookup(cloneLookup(DEFAULT_SOFT_TAGS), cfg.movementSoftTags)
     end
-    state.hasSoftClearRules = (next(state.softBlockLookup) ~= nil) or (next(state.softTagLookup) ~= nil)
+    if not state.softNameHints then
+        state.softNameHints = buildSoftNameHintList(cfg.movementSoftNameHints)
+    end
+    state.hasSoftClearRules = (next(state.softBlockLookup) ~= nil)
+        or (next(state.softTagLookup) ~= nil)
+        or ((state.softNameHints and #state.softNameHints > 0) or false)
 
     return state
 end

@@ -47,6 +47,7 @@ local DEFAULT_CONFIG = {
   initialFacing = "east",
   homeFacing = "east",
   minFuel = 200,
+  treeSpacing = 2,
   smeltBatch = 8,
   furnaceWait = 10,
   sleepSeconds = 10,
@@ -56,6 +57,7 @@ local DEFAULT_CONFIG = {
   torchMaterial = "minecraft:torch",
   keepCharcoal = 16,
   keepTorches = 16,
+  walkwayOffsetX = -2,
   factorySlots = {
     furnace = 4,
     outputChest = 5,
@@ -212,6 +214,22 @@ local function isInsideFactoryBounds(pos)
     and z >= FACTORY_BOUNDS.minZ and z <= FACTORY_BOUNDS.maxZ
 end
 
+-- Calculate which direction to face to look at the tree from current walkway position
+local function getTreeFacing(ctx)
+  local walk = currentWalkPosition(ctx)
+  local tree = currentTreePosition(ctx)
+  
+  local dx = tree.x - walk.x
+  local dz = tree.z - walk.z
+  
+  -- Determine primary direction based on largest offset
+  if math.abs(dx) > math.abs(dz) then
+    return dx > 0 and "east" or "west"
+  else
+    return dz > 0 and "south" or "north"
+  end
+end
+
 -- Move softly from current position to a fixed "safe" point outside the factory box.
 -- This never digs, so placed chests/furnace cannot be broken.
 local function moveSoftOutOfFactory(ctx)
@@ -221,6 +239,50 @@ local function moveSoftOutOfFactory(ctx)
     return false, err or "failed_soft_escape"
   end
   return true
+end
+
+-- Ensure the turtle exits the tree field via a safe walkway before heading home.
+local function retreatToFactoryHome(ctx)
+  local yLevel = (ctx.fieldOrigin and ctx.fieldOrigin.y) or 0
+  local targetZ = (ctx.origin and ctx.origin.z) or 0
+
+  if ctx.currentZ ~= targetZ then
+    local ok, err = moveToAvailableWalkway(ctx, yLevel, targetZ)
+    if not ok then
+      return false, err
+    end
+  end
+
+  local safeX = ctx.walkwayEntranceX or (ctx.origin and ctx.origin.x) or 0
+  if ctx.currentX ~= safeX then
+    local ok, err = goToWithFallback(ctx, { x = safeX, y = yLevel, z = targetZ }, MOVE_OPTS_SOFT)
+    if not ok then
+      return false, err
+    end
+    ctx.currentX = safeX
+  end
+
+  local ok, err = returnHome(ctx)
+  if not ok then
+    return false, err
+  end
+
+  ctx.currentX = ctx.origin and ctx.origin.x or 0
+  ctx.currentZ = ctx.origin and ctx.origin.z or 0
+  return true
+end
+
+local function logStateTransition(ctx, fromState, toState, note)
+  if not ctx or not ctx.logger then
+    return
+  end
+  local fromLabel = tostring(fromState or "nil")
+  local toLabel = tostring(toState or "nil")
+  if note and note ~= "" then
+    ctx.logger:info(string.format("state %s -> %s (%s)", fromLabel, toLabel, note))
+  else
+    ctx.logger:info(string.format("state %s -> %s", fromLabel, toLabel))
+  end
 end
 
 local function returnHome(ctx)
@@ -296,9 +358,9 @@ local function currentWalkPosition(ctx)
     tr = ctx.traverse
   end
   return {
-    x = ctx.fieldOrigin.x + (tr.col - 1),
+    x = ctx.fieldOrigin.x + (tr.col - 1) * ctx.treeSpacingX,
     y = ctx.fieldOrigin.y,
-    z = ctx.fieldOrigin.z + (tr.row - 1),
+    z = ctx.fieldOrigin.z + (tr.row - 1) * ctx.treeSpacingZ,
   }
 end
 
@@ -309,6 +371,143 @@ local function currentTreePosition(ctx)
     y = walk.y,
     z = walk.z + 1,
   }
+end
+
+local function insertUnique(tbl, value)
+  if not value or not tbl then
+    return
+  end
+  for _, existing in ipairs(tbl) do
+    if existing == value then
+      return
+    end
+  end
+  table.insert(tbl, value)
+end
+
+local function buildWalkwayCandidates(ctx)
+  ctx.walkwayCandidates = {}
+  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x + ctx.walkwayOffsetX)
+  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x - ctx.treeSpacingX)
+  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x + ctx.treeSpacingX)
+  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x + (ctx.gridWidth * ctx.treeSpacingX))
+  insertUnique(ctx.walkwayCandidates, ctx.fieldOrigin.x)
+  insertUnique(ctx.walkwayCandidates, ctx.origin.x)
+end
+
+local function isTreeColumnX(ctx, testX)
+  if not ctx or not ctx.fieldOrigin or testX == nil then
+    return false
+  end
+  local spacing = ctx.treeSpacingX or 1
+  local gridWidth = ctx.gridWidth or 0
+  local baseX = ctx.fieldOrigin.x or 0
+  for offset = 0, math.max(gridWidth - 1, 0) do
+    local treeX = baseX + offset * spacing
+    if treeX == testX then
+      return true
+    end
+  end
+  return false
+end
+
+local function ensureWalkwayAvailability(ctx)
+  local candidates = ctx.walkwayCandidates or {}
+  local safe = {}
+  local selected
+
+  for _, candidate in ipairs(candidates) do
+    if candidate ~= nil and not isTreeColumnX(ctx, candidate) then
+      insertUnique(safe, candidate)
+      selected = selected or candidate
+    end
+  end
+
+  if not selected then
+    local spacing = ctx.treeSpacingX or 1
+    local gridWidth = ctx.gridWidth or 1
+    local baseX = ctx.fieldOrigin and ctx.fieldOrigin.x or 0
+    local maxX = baseX + math.max(gridWidth - 1, 0) * spacing
+    local fallback = maxX + spacing
+    insertUnique(safe, fallback)
+    selected = fallback
+  end
+
+  ctx.walkwayCandidates = safe
+  ctx.walkwayEntranceX = selected or ctx.origin.x or 0
+end
+
+local function moveToAvailableWalkway(ctx, yLevel, targetZ)
+  local candidates = ctx.walkwayCandidates or { ctx.walkwayEntranceX }
+  local lastErr
+  for _, safeX in ipairs(candidates) do
+    if safeX then
+      local ok, err
+      if ctx.currentX ~= safeX then
+        ok, err = goToWithFallback(ctx, { x = safeX, y = yLevel, z = ctx.currentZ }, MOVE_OPTS_SOFT)
+        if not ok then
+          lastErr = err
+          goto next_candidate
+        end
+        ctx.currentX = safeX
+      end
+
+      if ctx.currentZ ~= targetZ then
+        ok, err = goToWithFallback(ctx, { x = safeX, y = yLevel, z = targetZ }, MOVE_OPTS_SOFT)
+        if not ok then
+          lastErr = err
+          goto next_candidate
+        end
+        ctx.currentZ = targetZ
+      end
+
+      ctx.walkwayEntranceX = safeX
+      return true
+    end
+    ::next_candidate::
+  end
+  return false, lastErr or "walkway_blocked"
+end
+
+local function moveAlongWalkway(ctx, target)
+  if not ctx or not target then
+    return false, "invalid_target"
+  end
+
+  if ctx.currentX == nil or ctx.currentZ == nil then
+    local ok, err = goToWithFallback(ctx, target, MOVE_OPTS_SOFT)
+    if ok then
+      ctx.currentX = target.x
+      ctx.currentZ = target.z
+    end
+    return ok, err
+  end
+
+  local currentY = target.y or ctx.fieldOrigin.y or 0
+  if ctx.currentZ ~= target.z then
+    local ok, err = moveToAvailableWalkway(ctx, currentY, target.z)
+    if not ok then
+      return false, err
+    end
+  end
+
+  if ctx.currentX ~= target.x then
+    local ok, err = goToWithFallback(ctx, { x = target.x, y = currentY, z = ctx.currentZ }, MOVE_OPTS_SOFT)
+    if not ok then
+      return false, err
+    end
+    ctx.currentX = target.x
+  end
+
+  if ctx.currentZ ~= target.z then
+    local ok, err = goToWithFallback(ctx, target, MOVE_OPTS_SOFT)
+    if not ok then
+      return false, err
+    end
+    ctx.currentZ = target.z
+  end
+
+  return true
 end
 
 local function isLogBlock(ctx, detail)
@@ -624,12 +823,42 @@ local function frontBlockDetail()
   return detail
 end
 
+local function collectNearbyDrops(ctx)
+  if not turtle or not turtle.suck then
+    return false
+  end
+  local collected = false
+  local function suckAll()
+    local grabbed = false
+    grabbed = turtle.suck() or grabbed
+    if turtle.suckDown then
+      grabbed = turtle.suckDown() or grabbed
+    end
+    if turtle.suckUp then
+      grabbed = turtle.suckUp() or grabbed
+    end
+    return grabbed
+  end
+
+  collected = suckAll() or collected
+  for _ = 1, 4 do
+    local ok = movement.turnRight and movement.turnRight(ctx)
+    if not ok then
+      break
+    end
+    collected = suckAll() or collected
+  end
+  return collected
+end
+
 -- STATE: INITIALIZE
 local function stateInitialize(ctx)
   ctx.config = loadConfig()
   ctx.logger = createLogger()
   ctx.gridWidth = ctx.config.gridWidth
   ctx.gridLength = ctx.config.gridLength
+  ctx.treeSpacingX = ctx.config.treeSpacingX or ctx.config.treeSpacing or 1
+  ctx.treeSpacingZ = ctx.config.treeSpacingZ or ctx.config.treeSpacing or 1
   ctx.saplingSlot = ctx.config.saplingSlot
   ctx.fuelSlot = ctx.config.fuelSlot
   ctx.torchSlot = ctx.config.torchSlot
@@ -639,8 +868,14 @@ local function stateInitialize(ctx)
   ctx.origin = { x = 0, y = 0, z = 0 }
   ctx.currentX = 0
   ctx.currentZ = 0
-  ctx.fieldOrigin = { x = 1, y = 0, z = -ctx.gridLength }
-  ctx.treeFacing = "south"
+  ctx.fieldOrigin = { x = 1, y = 0, z = -ctx.gridLength * ctx.treeSpacingZ }
+  ctx.walkwayOffsetX = ctx.config.walkwayOffsetX
+  if ctx.walkwayOffsetX == nil then
+    ctx.walkwayOffsetX = -ctx.treeSpacingX
+  end
+  ctx.walkwayEntranceX = ctx.fieldOrigin.x + ctx.walkwayOffsetX
+  buildWalkwayCandidates(ctx)
+  ensureWalkwayAvailability(ctx)
   ctx.factory = ctx.factory or {}
   ctx.factory.furnaceSlot = ctx.config.factorySlots.furnace
   ctx.factory.outputChestSlot = ctx.config.factorySlots.outputChest
@@ -731,36 +966,33 @@ local function stateTraverse(ctx)
   local target = currentWalkPosition(ctx)
 
   -- Critical safety: traversal never digs, ever.
-  ok, err = goToWithFallback(ctx, target, MOVE_OPTS_SOFT)
+  ok, err = moveAlongWalkway(ctx, target)
   if not ok then
     setError(ctx, string.format("failed to reach farm tile: %s", err or "unknown"), STATE_TRAVERSE)
     return STATE_ERROR
   end
-
-  ctx.currentX = target.x
-  ctx.currentZ = target.z
 
   return STATE_INSPECT_CELL
 end
 
 -- STATE: INSPECT_CELL
 local function stateInspectCell(ctx)
-  local ok, err = movement.faceDirection(ctx, ctx.treeFacing)
+  local treeFacing = getTreeFacing(ctx)
+  local ok, err = movement.faceDirection(ctx, treeFacing)
   if not ok then
     setError(ctx, err or "cannot face tree", STATE_INSPECT_CELL)
     return STATE_ERROR
   end
 
   local hasBlock, detail = turtle.inspect()
+  
+  -- Check for mature tree (actual log blocks)
   if hasBlock and isLogBlock(ctx, detail) then
     return STATE_CHOP
   end
 
-  if not hasBlock then
-    return STATE_PLANT
-  end
-
-  if isSaplingBlock(ctx, detail) then
+  -- Check for sapling (immature tree) - wait for it to grow
+  if hasBlock and isSaplingBlock(ctx, detail) then
     advanceTraversal(ctx)
     if ctx.traverse.done then
       return STATE_RETURN_HOME
@@ -768,25 +1000,36 @@ local function stateInspectCell(ctx)
     return STATE_TRAVERSE
   end
 
-  advanceTraversal(ctx)
-  if ctx.traverse.done then
-    return STATE_RETURN_HOME
+  -- No tree or sapling found - need to plant (or clear obstacle)
+  if not hasBlock then
+    return STATE_PLANT
   end
-  return STATE_TRAVERSE
+
+  -- There's some other block (grass, dirt, etc.) - try to plant anyway
+  -- The plant state will handle digging if needed
+  return STATE_PLANT
 end
 
 -- STATE: CHOP
 local function stateChop(ctx)
-  local ok, err = movement.faceDirection(ctx, ctx.treeFacing)
+  local treeFacing = getTreeFacing(ctx)
+  local ok, err = movement.faceDirection(ctx, treeFacing)
   if not ok then
     setError(ctx, err or "cannot face tree", STATE_CHOP)
     return STATE_ERROR
   end
 
+  -- Save the walking path position before entering tree
+  local walkX = ctx.currentX
+  local walkZ = ctx.currentZ
+  local walkTarget = { x = walkX, y = 0, z = walkZ }
+
   ensureInventory(ctx)
   local before = inventory.countMaterial(ctx, ctx.config.logMaterial, { force = true }) or 0
 
-  ok, err = movement.forward(ctx, MOVE_OPTS_CLEAR)
+  -- Dig the base log block, then move forward into the tree trunk
+  turtle.dig()
+  ok, err = movement.forward(ctx, MOVE_OPTS_SOFT)
   if not ok then
     setError(ctx, err or "failed entering tree", STATE_CHOP)
     return STATE_ERROR
@@ -815,21 +1058,26 @@ local function stateChop(ctx)
     ascended = ascended - 1
   end
 
-  ok, err = movement.turnAround(ctx)
+  -- Return to the walking path position explicitly
+  ok, err = goToWithFallback(ctx, walkTarget, MOVE_OPTS_SOFT)
+  if not ok then
+    setError(ctx, string.format("failed returning to path: %s", err or "unknown"), STATE_CHOP)
+    return STATE_ERROR
+  end
+
+  -- Face back toward the tree position (recalculate in case we're on a different cell)
+  treeFacing = getTreeFacing(ctx)
+  ok, err = movement.faceDirection(ctx, treeFacing)
   if not ok then
     setError(ctx, err or "turnaround failed", STATE_CHOP)
     return STATE_ERROR
   end
-  ok, err = movement.forward(ctx, MOVE_OPTS_SOFT)
-  if not ok then
-    setError(ctx, err or "failed returning", STATE_CHOP)
-    return STATE_ERROR
-  end
-  ok, err = movement.turnAround(ctx)
-  if not ok then
-    setError(ctx, err or "turnaround failed", STATE_CHOP)
-    return STATE_ERROR
-  end
+
+  -- Restore the saved position
+  ctx.currentX = walkX
+  ctx.currentZ = walkZ
+
+  collectNearbyDrops(ctx)
 
   inventory.invalidate(ctx)
   ensureInventory(ctx)
@@ -992,6 +1240,8 @@ local function stateCraft(ctx)
   return STATE_REFUEL
 end
 
+-- SMELT and CRAFT states removed; furnace/torch work now handled by factory_manager.lua
+
 -- STATE: REFUEL
 local function stateRefuel(ctx)
   local ok, err = refuelIfNeeded(ctx)
@@ -1026,7 +1276,13 @@ local function stateRestock(ctx)
     return fallback
   end
 
-  local ok, err = restockFromChest(ctx, request.chest, request.material, request.slot, request.amount)
+  local ok, err = retreatToFactoryHome(ctx)
+  if not ok then
+    setError(ctx, err or "failed returning for restock", STATE_RESTOCK)
+    return STATE_ERROR
+  end
+
+  ok, err = restockFromChest(ctx, request.chest, request.material, request.slot, request.amount)
   if not ok then
     setError(ctx, err or "restock failed", STATE_RESTOCK)
     return STATE_ERROR
@@ -1101,23 +1357,30 @@ local STATE_HANDLERS = {
 local function run()
   local ctx = {}
   local state = STATE_INITIALIZE
+  logStateTransition(ctx, nil, state, "start")
 
   while state do
-    ctx.state = state
-    local handler = STATE_HANDLERS[state]
+    local currentState = state
+    ctx.state = currentState
+    local handler = STATE_HANDLERS[currentState]
     if not handler then
-      print("[TREEFACTORY] Unknown state: " .. tostring(state))
+      print("[TREEFACTORY] Unknown state: " .. tostring(currentState))
       break
     end
 
     local ok, nextStateOrErr = pcall(handler, ctx)
+    local nextState
     if not ok then
       setError(ctx, nextStateOrErr, STATE_ERROR)
-      state = STATE_ERROR
+      nextState = STATE_ERROR
+      logStateTransition(ctx, currentState, nextState, "pcall failure")
     else
-      ctx.lastState = state
-      state = nextStateOrErr
+      ctx.lastState = currentState
+      nextState = nextStateOrErr
+      logStateTransition(ctx, currentState, nextState)
     end
+
+    state = nextState
   end
 end
 

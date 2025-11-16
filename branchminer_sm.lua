@@ -893,6 +893,19 @@ local function returnToDropoff(ctx, stayAtOrigin)
         return true
     end
 
+    -- Move away from the chest before attempting to navigate elsewhere
+    -- Turn around and move forward one block to clear the chest
+    ok, err = movement.turnAround(ctx)
+    if not ok then
+        return false, err
+    end
+    
+    ok, err = movement.forward(ctx, MOVE_OPTS)
+    if not ok then
+        return false, err
+    end
+
+    -- Now navigate back to the work position
     ok, err = movement.goTo(ctx, pos, MOVE_OPTS)
     if not ok then
         return false, err
