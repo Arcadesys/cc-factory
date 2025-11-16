@@ -165,6 +165,21 @@ local function mergeMoveOpts(baseOpts, extraOpts)
   return merged
 end
 
+-- Choose movement options based on a position: inside the factory footprint we
+-- never dig, outside we allow clearing. This keeps placed chests/furnace safe.
+local function moveOptsForPosition(pos)
+  if not pos then
+    return MOVE_OPTS_CLEAR
+  end
+  local x = pos.x or 0
+  local z = pos.z or 0
+  -- Hard no-dig rectangle covering the factory footprint around origin.
+  if x >= -2 and x <= 2 and z >= -3 and z <= 3 then
+    return MOVE_OPTS_SOFT
+  end
+  return MOVE_OPTS_CLEAR
+end
+
 local function goToWithFallback(ctx, position, moveOpts)
   local ok, err = movement.goTo(ctx, position, moveOpts)
   if ok or (moveOpts and moveOpts.axisOrder) then
@@ -348,7 +363,8 @@ local function placeFactoryBlock(ctx, key)
     return false, "missing_factory_definition"
   end
 
-  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_FACTORY)
+  -- Use soft movement so we never dig through previously-placed factory blocks
+  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
   if not ok then
     return false, err
   end
@@ -369,7 +385,7 @@ local function verifyFactoryBlock(ctx, key)
     return false, "missing_factory_definition"
   end
 
-  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_FACTORY)
+  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
   if not ok then
     return false, err
   end
@@ -538,7 +554,7 @@ local function depositToChest(ctx, key, material, keepCount)
   local toDrop = total - keepCount
 
   local approach = FACTORY_APPROACH[key]
-  ok = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_FACTORY)
+  ok = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
   if not ok then
     return false, "move_failed"
   end
@@ -570,7 +586,7 @@ local function restockFromChest(ctx, chestKey, material, slot, amount)
     return false, "unknown_chest"
   end
 
-  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_FACTORY)
+  local ok, err = goAndFace(ctx, approach.position, approach.facing, MOVE_OPTS_SOFT)
   if not ok then
     return false, err
   end
@@ -714,18 +730,8 @@ local function stateTraverse(ctx)
 
   local target = currentWalkPosition(ctx)
 
-  -- Ensure we are safely outside the factory bounding box before any digging moves.
-  -- This run uses soft movement only, so factory blocks are never broken.
-  if isInsideFactoryBounds(ctx.origin) or isInsideFactoryBounds(ctx.position) then
-    ok, err = moveSoftOutOfFactory(ctx)
-    if not ok then
-      setError(ctx, string.format("failed to exit factory zone: %s", err or "unknown"), STATE_TRAVERSE)
-      return STATE_ERROR
-    end
-  end
-
-  -- Now we are outside the factory; it's safe to use clearing moves toward the field.
-  ok, err = goToWithFallback(ctx, target, MOVE_OPTS_CLEAR)
+  -- Critical safety: traversal never digs, ever.
+  ok, err = goToWithFallback(ctx, target, MOVE_OPTS_SOFT)
   if not ok then
     setError(ctx, string.format("failed to reach farm tile: %s", err or "unknown"), STATE_TRAVERSE)
     return STATE_ERROR
@@ -846,6 +852,18 @@ local function statePlant(ctx)
     return STATE_ERROR
   end
 
+  -- Check if target slot has saplings; if not, look for saplings in other slots
+  if turtle.getItemCount(slot) <= 0 then
+    ensureInventory(ctx)
+    local saplingSlot = inventory.getSlotForMaterial(ctx, ctx.config.saplingMaterial, { force = true })
+    if saplingSlot and saplingSlot ~= slot then
+      -- Found saplings in another slot; move some to the planting slot
+      turtle.select(saplingSlot)
+      turtle.transferTo(slot, math.min(turtle.getItemCount(saplingSlot), 16))
+    end
+  end
+
+  -- If still empty after consolidation, restock from chest
   if turtle.getItemCount(slot) <= 0 then
     queueRestock(ctx, { material = ctx.config.saplingMaterial, slot = slot, chest = "saplingChest", amount = 16 })
     return STATE_RESTOCK
