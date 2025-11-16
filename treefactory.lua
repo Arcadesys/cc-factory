@@ -923,8 +923,29 @@ local function statePlant(ctx)
     return STATE_ERROR
   end
 
-  -- Move to the correct tree planting position (reference-frame aware)
+  -- DEBUG: Print current walkway and tree cell positions
+  local walkRef = currentWalkPositionRef(ctx)
+  local walkWorld = referenceToWorld(ctx, walkRef)
   local treeRef = worldstate.offsetFromCell(ctx, { x = 1 })
+  local treeWorld = referenceToWorld(ctx, treeRef)
+  if ctx.logger then
+    if walkRef and walkWorld then
+      ctx.logger:info(string.format("Walkway ref: x=%s y=%s z=%s | world: x=%s y=%s z=%s",
+        tostring(walkRef.x), tostring(walkRef.y), tostring(walkRef.z),
+        tostring(walkWorld.x), tostring(walkWorld.y), tostring(walkWorld.z)))
+    else
+      ctx.logger:info("Walkway ref or world is nil")
+    end
+    if treeRef and treeWorld then
+      ctx.logger:info(string.format("Tree ref: x=%s y=%s z=%s | world: x=%s y=%s z=%s",
+        tostring(treeRef.x), tostring(treeRef.y), tostring(treeRef.z),
+        tostring(treeWorld.x), tostring(treeWorld.y), tostring(treeWorld.z)))
+    else
+      ctx.logger:info("Tree ref or world is nil")
+    end
+  end
+
+  -- Move to the correct tree planting position (reference-frame aware)
   ok, err = goToReference(ctx, treeRef, MOVE_OPTS_SOFT)
   if not ok then
     setError(ctx, err or "cannot move to tree cell", STATE_PLANT)
