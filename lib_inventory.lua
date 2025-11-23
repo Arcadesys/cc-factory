@@ -10,6 +10,7 @@ optional error messages.
 
 local inventory = {}
 local movement = require("lib_movement")
+local logger = require("lib_logger")
 
 local SIDE_ACTIONS = {
     forward = {
@@ -48,41 +49,37 @@ local OPPOSITE_FACING = {
     west = "east",
 }
 
-local function log(ctx, level, message)
-    if type(ctx) ~= "table" then
-        return
-    end
-    local logger = ctx.logger
-    if type(logger) ~= "table" then
-        return
-    end
-    local fn = logger[level]
-    if type(fn) == "function" then
-        fn(message)
-        return
-    end
-    if type(logger.log) == "function" then
-        logger.log(level, message)
-    end
-end
-
-local CONTAINER_KEYWORDS = {
-    "chest",
-    "barrel",
-    "drawer",
-    "cabinet",
-    "crate",
-    "locker",
-    "storage",
-    "box",
-    "bin",
-    "cache",
-    "shelf",
-    "cupboard",
-    "depot",
-    "controller",
-    "shulker",
-    "shulkerbox",
+inventory.DEFAULT_TRASH = {
+    ["minecraft:air"] = true,
+    ["minecraft:stone"] = true,
+    ["minecraft:cobblestone"] = true,
+    ["minecraft:deepslate"] = true,
+    ["minecraft:cobbled_deepslate"] = true,
+    ["minecraft:tuff"] = true,
+    ["minecraft:diorite"] = true,
+    ["minecraft:granite"] = true,
+    ["minecraft:andesite"] = true,
+    ["minecraft:calcite"] = true,
+    ["minecraft:netherrack"] = true,
+    ["minecraft:end_stone"] = true,
+    ["minecraft:basalt"] = true,
+    ["minecraft:blackstone"] = true,
+    ["minecraft:gravel"] = true,
+    ["minecraft:dirt"] = true,
+    ["minecraft:coarse_dirt"] = true,
+    ["minecraft:rooted_dirt"] = true,
+    ["minecraft:mycelium"] = true,
+    ["minecraft:sand"] = true,
+    ["minecraft:red_sand"] = true,
+    ["minecraft:sandstone"] = true,
+    ["minecraft:red_sandstone"] = true,
+    ["minecraft:clay"] = true,
+    ["minecraft:dripstone_block"] = true,
+    ["minecraft:pointed_dripstone"] = true,
+    ["minecraft:bedrock"] = true,
+    ["minecraft:lava"] = true,
+    ["minecraft:water"] = true,
+    ["minecraft:torch"] = true,
 }
 
 local function noop()
@@ -578,7 +575,7 @@ local function ensureChestAhead(ctx, opts)
         if movement.getFacing(ctx) ~= startFacing then
             local okFace, faceErr = movement.faceDirection(ctx, startFacing)
             if not okFace and faceErr then
-                log(ctx, "warn", "Failed to restore facing: " .. tostring(faceErr))
+                logger.log(ctx, "warn", "Failed to restore facing: " .. tostring(faceErr))
             end
         end
     end
@@ -600,7 +597,7 @@ local function ensureChestAhead(ctx, opts)
     end
     local leftOk, leftDetail = inspectForwardForContainer()
     if leftOk then
-        log(ctx, "debug", "Found container on left side; using that")
+        logger.log(ctx, "debug", "Found container on left side; using that")
         return true, makeRestore(), { side = "left", detail = leftDetail }
     end
     ok, err = movement.turnRight(ctx)
@@ -617,7 +614,7 @@ local function ensureChestAhead(ctx, opts)
     end
     local rightOk, rightDetail = inspectForwardForContainer()
     if rightOk then
-        log(ctx, "debug", "Found container on right side; using that")
+        logger.log(ctx, "debug", "Found container on right side; using that")
         return true, makeRestore(), { side = "right", detail = rightDetail }
     end
     ok, err = movement.turnLeft(ctx)
@@ -639,7 +636,7 @@ local function ensureChestAhead(ctx, opts)
     end
     local backOk, backDetail = inspectForwardForContainer()
     if backOk then
-        log(ctx, "debug", "Found container behind; using that")
+        logger.log(ctx, "debug", "Found container behind; using that")
         return true, makeRestore(), { side = "back", detail = backDetail }
     end
     ok, err = movement.turnLeft(ctx)
@@ -769,7 +766,7 @@ function inventory.scan(ctx, opts)
     state.scanVersion = state.scanVersion + 1
     state.dirty = false
 
-    log(ctx, "debug", string.format("Inventory scan complete: %d items across %d materials", totalItems, tableCount(materialSlots)))
+    logger.log(ctx, "debug", string.format("Inventory scan complete: %d items across %d materials", totalItems, tableCount(materialSlots)))
     return true
 end
 
@@ -1013,7 +1010,7 @@ local function rescanIfNeeded(ctx, opts)
     end
     local ok, err = inventory.scan(ctx)
     if not ok and err then
-        log(ctx, "warn", "Inventory rescan failed: " .. tostring(err))
+        logger.log(ctx, "warn", "Inventory rescan failed: " .. tostring(err))
         inventory.invalidate(ctx)
     end
 end
@@ -1247,7 +1244,7 @@ function inventory.pullMaterial(ctx, material, amount, opts)
                             end
                         else
                             if pushErr then
-                                log(ctx, "debug", string.format("Unable to clear slot %d while restocking %s: %s", slot, material or "unknown", pushErr))
+                                logger.log(ctx, "debug", string.format("Unable to clear slot %d while restocking %s: %s", slot, material or "unknown", pushErr))
                             end
                         end
                     end
@@ -1284,7 +1281,7 @@ function inventory.pullMaterial(ctx, material, amount, opts)
         for _, slot in ipairs(stashSlots) do
             local pushOk, pushErr = inventory.pushSlot(ctx, slot, nil, pushOpts)
             if not pushOk and pushErr then
-                log(ctx, "warn", string.format("Failed to return cycled item from slot %d: %s", slot, tostring(pushErr)))
+                logger.log(ctx, "warn", string.format("Failed to return cycled item from slot %d: %s", slot, tostring(pushErr)))
             end
         end
         turtle.select(targetSlot)
@@ -1369,11 +1366,11 @@ function inventory.pullMaterial(ctx, material, amount, opts)
 
     if success then
         if assumedMatch then
-            log(ctx, "debug", string.format("Pulled %s without detailed item metadata", material or "unknown"))
+            logger.log(ctx, "debug", string.format("Pulled %s without detailed item metadata", material or "unknown"))
         elseif cycled > 0 then
-            log(ctx, "debug", string.format("Pulled %s after cycling %d other stacks", material, cycled))
+            logger.log(ctx, "debug", string.format("Pulled %s after cycling %d other stacks", material, cycled))
         else
-            log(ctx, "debug", string.format("Pulled %s directly via turtle.suck", material))
+            logger.log(ctx, "debug", string.format("Pulled %s directly via turtle.suck", material))
         end
         returnStash(true)
         restoreFacing()
@@ -1384,12 +1381,31 @@ function inventory.pullMaterial(ctx, material, amount, opts)
     returnStash(true)
     restoreFacing()
     if failureReason then
-        log(ctx, "debug", string.format("Failed to pull %s after cycling %d stacks: %s", material, cycled, failureReason))
+        logger.log(ctx, "debug", string.format("Failed to pull %s after cycling %d stacks: %s", material, cycled, failureReason))
     end
     if failureReason == "suck_failed" then
         return false, "missing_material"
     end
     return false, failureReason or "missing_material"
+end
+
+function inventory.dumpTrash(ctx, trashList)
+    if not turtle then return false, "turtle API unavailable" end
+    trashList = trashList or inventory.DEFAULT_TRASH
+    
+    local state, err = ensureScanned(ctx)
+    if not state then return false, err end
+
+    for slot, info in pairs(state.slots) do
+        if info and info.name and trashList[info.name] then
+            turtle.select(slot)
+            turtle.drop()
+        end
+    end
+    
+    -- Force rescan after dumping
+    inventory.scan(ctx)
+    return true
 end
 
 function inventory.clearSlot(ctx, slot, opts)
@@ -1409,6 +1425,105 @@ function inventory.clearSlot(ctx, slot, opts)
         return false, dropErr
     end
     return true
+end
+
+function inventory.describeMaterials(io, info)
+    if not io.print then
+        return
+    end
+    io.print("Schema manifest requirements:")
+    if not info or not info.materials then
+        io.print(" - <none>")
+        return
+    end
+    for _, entry in ipairs(info.materials) do
+        if entry.material ~= "minecraft:air" and entry.material ~= "air" then
+            io.print(string.format(" - %s x%d", entry.material, entry.count or 0))
+        end
+    end
+end
+
+function inventory.runCheck(ctx, io, opts)
+    local ok, report = initialize.ensureMaterials(ctx, { manifest = ctx.schemaInfo and ctx.schemaInfo.materials }, opts)
+    if io.print then
+        if ok then
+            io.print("Material check passed. Turtle and chests meet manifest requirements.")
+        else
+            io.print("Material check failed. Missing materials:")
+            for _, entry in ipairs(report.missing or {}) do
+                io.print(string.format(" - %s: need %d, have %d", entry.material, entry.required, entry.have))
+            end
+        end
+    end
+    return ok, report
+end
+
+function inventory.gatherSummary(io, report)
+    if not io.print then
+        return
+    end
+    io.print("\nDetailed totals:")
+    io.print(" Turtle inventory:")
+    for material, count in pairs(report.turtleTotals or {}) do
+        io.print(string.format("   - %s x%d", material, count))
+    end
+    io.print(" Nearby chests:")
+    for material, count in pairs(report.chestTotals or {}) do
+        io.print(string.format("   - %s x%d", material, count))
+    end
+    if #report.chests > 0 then
+        io.print(" Per-chest breakdown:")
+        for _, entry in ipairs(report.chests) do
+            io.print(string.format("   [%s] %s", entry.side, entry.name or "container"))
+            for material, count in pairs(entry.totals or {}) do
+                io.print(string.format("     * %s x%d", material, count))
+            end
+        end
+    end
+end
+
+function inventory.describeTotals(io, totals)
+    totals = totals or {}
+    local keys = {}
+    for material in pairs(totals) do
+        keys[#keys + 1] = material
+    end
+    table.sort(keys)
+    if io.print then
+        if #keys == 0 then
+            io.print("Inventory totals: <empty>")
+        else
+            io.print("Inventory totals:")
+            for _, material in ipairs(keys) do
+                io.print(string.format(" - %s x%d", material, totals[material] or 0))
+            end
+        end
+    end
+end
+
+function inventory.computeManifest(list)
+    local totals = {}
+    for _, sc in ipairs(list) do
+        if sc.material and sc.material ~= "" then
+            totals[sc.material] = (totals[sc.material] or 0) + 1
+        end
+    end
+    return totals
+end
+
+function inventory.printManifest(io, manifest)
+    if not io.print then
+        return
+    end
+    io.print("\nRequested manifest (minimum counts):")
+    local shown = false
+    for material, count in pairs(manifest) do
+        io.print(string.format(" - %s x%d", material, count))
+        shown = true
+    end
+    if not shown then
+        io.print(" - <empty>")
+    end
 end
 
 return inventory

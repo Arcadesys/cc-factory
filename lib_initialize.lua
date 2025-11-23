@@ -8,58 +8,20 @@ materials before a print begins.
 ---@diagnostic disable: undefined-global
 
 local inventory = require("lib_inventory")
+local logger = require("lib_logger")
+local world = require("lib_world")
+local table_utils = require("lib_table")
 
 local initialize = {}
 
 local DEFAULT_SIDES = { "forward", "down", "up", "left", "right", "back" }
-
-local SIDE_ALIASES = {
-    forward = "forward",
-    front = "forward",
-    down = "down",
-    bottom = "down",
-    up = "up",
-    top = "up",
-    left = "left",
-    right = "right",
-    back = "back",
-    behind = "back",
-}
-
-local function normaliseSide(side)
-    if type(side) ~= "string" then
-        return nil
-    end
-    return SIDE_ALIASES[string.lower(side)]
-end
-
-local function log(ctx, level, message)
-    if type(ctx) ~= "table" then
-        return
-    end
-    local logger = ctx.logger
-    if type(logger) ~= "table" then
-        if level == "error" or level == "warn" then
-            print(string.format("[%s] %s", level:upper(), message))
-        end
-        return
-    end
-    local fn = logger[level]
-    if type(fn) == "function" then
-        fn(message)
-        return
-    end
-    if type(logger.log) == "function" then
-        logger.log(level, message)
-    end
-end
 
 local function mapSides(opts)
     local sides = {}
     local seen = {}
     if type(opts) == "table" and type(opts.sides) == "table" then
         for _, side in ipairs(opts.sides) do
-            local normalised = normaliseSide(side)
+            local normalised = world.normaliseSide(side)
             if normalised and not seen[normalised] then
                 sides[#sides + 1] = normalised
                 seen[normalised] = true
@@ -68,7 +30,7 @@ local function mapSides(opts)
     end
     if #sides == 0 then
         for _, side in ipairs(DEFAULT_SIDES) do
-            local normalised = normaliseSide(side)
+            local normalised = world.normaliseSide(side)
             if normalised and not seen[normalised] then
                 sides[#sides + 1] = normalised
                 seen[normalised] = true
@@ -76,69 +38,6 @@ local function mapSides(opts)
         end
     end
     return sides
-end
-
-local function toPeripheralSide(side)
-    local normalised = normaliseSide(side) or side
-    if normalised == "forward" then
-        return "front"
-    elseif normalised == "up" then
-        return "top"
-    elseif normalised == "down" then
-        return "bottom"
-    elseif normalised == "back" then
-        return "back"
-    elseif normalised == "left" then
-        return "left"
-    elseif normalised == "right" then
-        return "right"
-    end
-    return normalised
-end
-
-local function inspectSide(side)
-    local normalised = normaliseSide(side)
-    if normalised == "forward" then
-        return turtle and turtle.inspect and turtle.inspect()
-    elseif normalised == "up" then
-        return turtle and turtle.inspectUp and turtle.inspectUp()
-    elseif normalised == "down" then
-        return turtle and turtle.inspectDown and turtle.inspectDown()
-    end
-    return false
-end
-
-local function isContainer(detail)
-    if type(detail) ~= "table" then
-        return false
-    end
-    local name = string.lower(detail.name or "")
-    if name:find("chest", 1, true) or name:find("barrel", 1, true) or name:find("drawer", 1, true) then
-        return true
-    end
-    if type(detail.tags) == "table" then
-        for tag in pairs(detail.tags) do
-            local lowered = string.lower(tag)
-            if lowered:find("inventory", 1, true) or lowered:find("chest", 1, true) or lowered:find("barrel", 1, true) then
-                return true
-            end
-        end
-    end
-    return false
-end
-
-local function copyTotals(totals)
-    local result = {}
-    for material, count in pairs(totals or {}) do
-        result[material] = count
-    end
-    return result
-end
-
-local function mergeTotals(target, source)
-    for material, count in pairs(source or {}) do
-        target[material] = (target[material] or 0) + count
-    end
 end
 
 local function normaliseManifest(manifest)
@@ -202,6 +101,70 @@ local function listChestTotals(peripheralObj)
     return totals
 end
 
+local function gatherChestDataForSide(side, entries, combined)
+    local periphSide = world.toPeripheralSide(side) or side
+    local inspectOk, inspectDetail = world.inspectSide(side)
+    local inspectIsContainer = inspectOk and world.isContainer(inspectDetail)
+    local inspectName = nil
+    if inspectIsContainer and type(inspectDetail) == "table" and type(inspectDetail.name) == "string" and inspectDetail.name ~= "" then
+        inspectName = inspectDetail.name
+    end
+
+    local wrapOk, wrapped = pcall(peripheral.wrap, periphSide)
+    if not wrapOk then
+        wrapped = nil
+    end
+
+    local metaName, metaTags
+    if wrapped then
+        if type(peripheral.call) == "function" then
+            local metaOk, metadata = pcall(peripheral.call, periphSide, "getMetadata")
+            if metaOk and type(metadata) == "table" then
+                metaName = metadata.name or metadata.displayName or metaName
+                metaTags = metadata.tags
+            end
+        end
+        if not metaName and type(peripheral.getType) == "function" then
+            local typeOk, perType = pcall(peripheral.getType, periphSide)
+            if typeOk then
+                if type(perType) == "string" then
+                    metaName = perType
+                elseif type(perType) == "table" and type(perType[1]) == "string" then
+                    metaName = perType[1]
+                end
+            end
+        end
+    end
+
+    local metaIsContainer = false
+    if metaName then
+        metaIsContainer = world.isContainer({ name = metaName, tags = metaTags })
+    end
+
+    local hasInventoryMethods = wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function")
+    local containerDetected = inspectIsContainer or metaIsContainer or hasInventoryMethods
+
+    if containerDetected then
+        local containerName = inspectName or metaName or "container"
+        if wrapped and hasInventoryMethods then
+            local totals = listChestTotals(wrapped)
+            table_utils.mergeTotals(combined, totals)
+            entries[#entries + 1] = {
+                side = side,
+                name = containerName,
+                totals = totals,
+            }
+        else
+            entries[#entries + 1] = {
+                side = side,
+                name = containerName,
+                totals = {},
+                error = "wrap_failed",
+            }
+        end
+    end
+end
+
 local function gatherChestData(ctx, opts)
     local entries = {}
     local combined = {}
@@ -209,67 +172,7 @@ local function gatherChestData(ctx, opts)
         return entries, combined
     end
     for _, side in ipairs(mapSides(opts)) do
-        local periphSide = toPeripheralSide(side) or side
-        local inspectOk, inspectDetail = inspectSide(side)
-        local inspectIsContainer = inspectOk and isContainer(inspectDetail)
-        local inspectName = nil
-        if inspectIsContainer and type(inspectDetail) == "table" and type(inspectDetail.name) == "string" and inspectDetail.name ~= "" then
-            inspectName = inspectDetail.name
-        end
-
-        local wrapOk, wrapped = pcall(peripheral.wrap, periphSide)
-        if not wrapOk then
-            wrapped = nil
-        end
-
-        local metaName, metaTags
-        if wrapped then
-            if type(peripheral.call) == "function" then
-                local metaOk, metadata = pcall(peripheral.call, periphSide, "getMetadata")
-                if metaOk and type(metadata) == "table" then
-                    metaName = metadata.name or metadata.displayName or metaName
-                    metaTags = metadata.tags
-                end
-            end
-            if not metaName and type(peripheral.getType) == "function" then
-                local typeOk, perType = pcall(peripheral.getType, periphSide)
-                if typeOk then
-                    if type(perType) == "string" then
-                        metaName = perType
-                    elseif type(perType) == "table" and type(perType[1]) == "string" then
-                        metaName = perType[1]
-                    end
-                end
-            end
-        end
-
-        local metaIsContainer = false
-        if metaName then
-            metaIsContainer = isContainer({ name = metaName, tags = metaTags })
-        end
-
-        local hasInventoryMethods = wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function")
-        local containerDetected = inspectIsContainer or metaIsContainer or hasInventoryMethods
-
-        if containerDetected then
-            local containerName = inspectName or metaName or "container"
-            if wrapped and hasInventoryMethods then
-                local totals = listChestTotals(wrapped)
-                mergeTotals(combined, totals)
-                entries[#entries + 1] = {
-                    side = side,
-                    name = containerName,
-                    totals = totals,
-                }
-            else
-                entries[#entries + 1] = {
-                    side = side,
-                    name = containerName,
-                    totals = {},
-                    error = "wrap_failed",
-                }
-            end
-        end
+        gatherChestDataForSide(side, entries, combined)
     end
     if next(combined) == nil then
         combined = {}
@@ -337,16 +240,9 @@ local function promptUser(report, attempt, opts)
     return true
 end
 
-function initialize.checkMaterials(ctx, spec, opts)
-    opts = opts or {}
-    spec = spec or {}
-    local manifestSrc = spec.manifest or spec.materials or spec
-    if not manifestSrc and type(ctx) == "table" and type(ctx.schemaInfo) == "table" then
-        manifestSrc = ctx.schemaInfo.materials
-    end
-    local manifest = normaliseManifest(manifestSrc)
+local function checkMaterialsInternal(ctx, manifest, opts)
     local report = {
-        manifest = copyTotals(manifest),
+        manifest = table_utils.copyTotals(manifest),
     }
     if next(manifest) == nil then
         report.ok = true
@@ -356,16 +252,16 @@ function initialize.checkMaterials(ctx, spec, opts)
     local turtleTotals, invErr = gatherTurtleTotals(ctx)
     if invErr then
         report.inventoryError = invErr
-        log(ctx, "warn", "Inventory scan failed: " .. tostring(invErr))
+        logger.log(ctx, "warn", "Inventory scan failed: " .. tostring(invErr))
     end
-    report.turtleTotals = copyTotals(turtleTotals)
+    report.turtleTotals = table_utils.copyTotals(turtleTotals)
 
     local chestEntries, chestTotals = gatherChestData(ctx, opts)
     report.chests = chestEntries
-    report.chestTotals = copyTotals(chestTotals)
+    report.chestTotals = table_utils.copyTotals(chestTotals)
 
-    local combinedTotals = copyTotals(turtleTotals)
-    mergeTotals(combinedTotals, chestTotals)
+    local combinedTotals = table_utils.copyTotals(turtleTotals)
+    table_utils.mergeTotals(combinedTotals, chestTotals)
     report.combinedTotals = combinedTotals
 
     report.missing = summariseMissing(manifest, combinedTotals)
@@ -378,16 +274,27 @@ function initialize.checkMaterials(ctx, spec, opts)
     return false, report
 end
 
+function initialize.checkMaterials(ctx, spec, opts)
+    opts = opts or {}
+    spec = spec or {}
+    local manifestSrc = spec.manifest or spec.materials or spec
+    if not manifestSrc and type(ctx) == "table" and type(ctx.schemaInfo) == "table" then
+        manifestSrc = ctx.schemaInfo.materials
+    end
+    local manifest = normaliseManifest(manifestSrc)
+    return checkMaterialsInternal(ctx, manifest, opts)
+end
+
 function initialize.ensureMaterials(ctx, spec, opts)
     opts = opts or {}
     local attempt = 0
     while true do
         local ok, report = initialize.checkMaterials(ctx, spec, opts)
         if ok then
-            log(ctx, "info", "Material check passed.")
+            logger.log(ctx, "info", "Material check passed.")
             return true, report
         end
-        log(ctx, "warn", "Materials missing; print halted.")
+        logger.log(ctx, "warn", "Materials missing; print halted.")
         if opts.nonInteractive then
             return false, report
         end

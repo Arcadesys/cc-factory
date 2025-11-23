@@ -7,10 +7,10 @@ CC:Tweaked turtle.
 
 ---@diagnostic disable: undefined-global, undefined-field
 
-local initialize = require("lib_initialize")
 local inventory = require("lib_inventory")
 local parser = require("lib_parser")
 local common = require("harness_common")
+local reporter = require("lib_reporter")
 
 local DEFAULT_CONTEXT = {
     config = {
@@ -72,99 +72,30 @@ local function ensureParserSchema(ctx, io)
     return true
 end
 
-local function describeMaterials(io, info)
-    if not io.print then
-        return
-    end
-    io.print("Schema manifest requirements:")
-    if not info or not info.materials then
-        io.print(" - <none>")
-        return
-    end
-    for _, entry in ipairs(info.materials) do
-        if entry.material ~= "minecraft:air" and entry.material ~= "air" then
-            io.print(string.format(" - %s x%d", entry.material, entry.count or 0))
-        end
-    end
-end
-
-local function detectContainers(io)
-    local found = {}
-    local sides = { "forward", "down", "up" }
-    local labels = {
-        forward = "front",
-        down = "below",
-        up = "above",
-    }
-    for _, side in ipairs(sides) do
-        local inspect
-        if side == "forward" then
-            inspect = turtle.inspect
-        elseif side == "up" then
-            inspect = turtle.inspectUp
-        else
-            inspect = turtle.inspectDown
-        end
-        if type(inspect) == "function" then
-            local ok, detail = inspect()
-            if ok then
-                local name = type(detail.name) == "string" and detail.name or "unknown"
-                found[#found + 1] = string.format(" %s: %s", labels[side] or side, name)
-            end
-        end
-    end
-    if io.print then
-        if #found == 0 then
-            io.print("Detected containers: <none>")
-        else
-            io.print("Detected containers:")
-            for _, line in ipairs(found) do
-                io.print(" -" .. line)
-            end
-        end
-    end
-end
-
 local function promptReady(io)
     common.promptEnter(io, "Arrange materials across the turtle inventory and chests, then press Enter to continue.")
 end
 
-local function runCheck(ctx, io, opts)
-    local ok, report = initialize.ensureMaterials(ctx, { manifest = ctx.schemaInfo and ctx.schemaInfo.materials }, opts)
-    if io.print then
-        if ok then
-            io.print("Material check passed. Turtle and chests meet manifest requirements.")
-        else
-            io.print("Material check failed. Missing materials:")
-            for _, entry in ipairs(report.missing or {}) do
-                io.print(string.format(" - %s: need %d, have %d", entry.material, entry.required, entry.have))
-            end
+local function runMaterialCheckLoop(ctx, io)
+    local attempt = 1
+    while true do
+        if io.print then
+            io.print(string.format("\n-- Check attempt %d --", attempt))
         end
-    end
-    return ok, report
-end
-
-local function gatherSummary(io, report)
-    if not io.print then
-        return
-    end
-    io.print("\nDetailed totals:")
-    io.print(" Turtle inventory:")
-    for material, count in pairs(report.turtleTotals or {}) do
-        io.print(string.format("   - %s x%d", material, count))
-    end
-    io.print(" Nearby chests:")
-    for material, count in pairs(report.chestTotals or {}) do
-        io.print(string.format("   - %s x%d", material, count))
-    end
-    if #report.chests > 0 then
-        io.print(" Per-chest breakdown:")
-        for _, entry in ipairs(report.chests) do
-            io.print(string.format("   [%s] %s", entry.side, entry.name or "container"))
-            for material, count in pairs(entry.totals or {}) do
-                io.print(string.format("     * %s x%d", material, count))
-            end
+        local success, report = reporter.runCheck(ctx, io, {})
+        if success then
+            reporter.gatherSummary(io, report)
+            break
         end
+        if io.print then
+            io.print("Adjust supplies and press Enter to retry, or type 'cancel' to exit.")
+        end
+        local response = common.prompt(io, "Continue? (Enter to retry / cancel to stop)", { allowEmpty = true, default = "" })
+        if response and response:lower() == "cancel" then
+            reporter.gatherSummary(io, report)
+            break
+        end
+        attempt = attempt + 1
     end
 end
 
@@ -188,30 +119,11 @@ local function run(ctxOverrides, ioOverrides)
         error("Failed to load sample schema: " .. tostring(err))
     end
 
-    describeMaterials(io, ctx.schemaInfo)
-    detectContainers(io)
+    reporter.describeMaterials(io, ctx.schemaInfo)
+    reporter.detectContainers(io)
     promptReady(io)
 
-    local attempt = 1
-    while true do
-        if io.print then
-            io.print(string.format("\n-- Check attempt %d --", attempt))
-        end
-        local success, report = runCheck(ctx, io, {})
-        if success then
-            gatherSummary(io, report)
-            break
-        end
-        if io.print then
-            io.print("Adjust supplies and press Enter to retry, or type 'cancel' to exit.")
-        end
-        local response = common.prompt(io, "Continue? (Enter to retry / cancel to stop)", { allowEmpty = true, default = "" })
-        if response and response:lower() == "cancel" then
-            gatherSummary(io, report)
-            break
-        end
-        attempt = attempt + 1
-    end
+    runMaterialCheckLoop(ctx, io)
 
     if io.print then
         io.print("Initialization harness complete.")

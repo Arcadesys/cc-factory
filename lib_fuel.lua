@@ -9,6 +9,8 @@ from configured sources.
 
 local movement = require("lib_movement")
 local inventory = require("lib_inventory")
+local table_utils = require("lib_table")
+local logger = require("lib_logger")
 
 local fuel = {}
 
@@ -24,51 +26,6 @@ local DEFAULT_FUEL_ITEMS = {
     "minecraft:dried_kelp_block",
 }
 
-local function copyArray(source)
-    local result = {}
-    if type(source) ~= "table" then
-        return result
-    end
-    for i = 1, #source do
-        result[i] = source[i]
-    end
-    return result
-end
-
-local function sumValues(tbl)
-    local total = 0
-    if type(tbl) ~= "table" then
-        return total
-    end
-    for _, value in pairs(tbl) do
-        if type(value) == "number" then
-            total = total + value
-        end
-    end
-    return total
-end
-
-local function log(ctx, level, message)
-    if type(ctx) ~= "table" then
-        return
-    end
-    local logger = ctx.logger
-    if type(logger) == "table" then
-        local fn = logger[level]
-        if type(fn) == "function" then
-            fn(message)
-            return
-        end
-        if type(logger.log) == "function" then
-            logger.log(level, message)
-            return
-        end
-    end
-    if (level == "warn" or level == "error") and message then
-        print(string.format("[%s] %s", level:upper(), message))
-    end
-end
-
 local function ensureFuelState(ctx)
     if type(ctx) ~= "table" then
         error("fuel library requires a context table", 2)
@@ -77,33 +34,11 @@ local function ensureFuelState(ctx)
     local state = ctx.fuelState
     local cfg = ctx.config or {}
 
-    if type(state.threshold) ~= "number" then
-        local cfgThreshold = cfg.fuelThreshold or cfg.minFuel
-        state.threshold = cfgThreshold or DEFAULT_THRESHOLD
-    end
-    if type(state.reserve) ~= "number" then
-        local cfgReserve = cfg.fuelReserve
-        local baseline = state.threshold or DEFAULT_THRESHOLD
-        state.reserve = cfgReserve or math.max(DEFAULT_RESERVE, baseline * 2)
-    end
-    if type(state.fuelItems) ~= "table" or #state.fuelItems == 0 then
-        if type(cfg.fuelItems) == "table" and #cfg.fuelItems > 0 then
-            state.fuelItems = copyArray(cfg.fuelItems)
-        else
-            state.fuelItems = copyArray(DEFAULT_FUEL_ITEMS)
-        end
-    end
-    if type(state.sides) ~= "table" or #state.sides == 0 then
-        if type(cfg.fuelChestSides) == "table" and #cfg.fuelChestSides > 0 then
-            state.sides = copyArray(cfg.fuelChestSides)
-        else
-            state.sides = copyArray(DEFAULT_SIDES)
-        end
-    end
-    if type(state.cycleLimit) ~= "number" or state.cycleLimit <= 0 then
-        local cfgLimit = cfg.fuelCycleLimit or cfg.inventoryCycleLimit
-        state.cycleLimit = (cfgLimit and math.max(cfgLimit, 32)) or 192
-    end
+    state.threshold = state.threshold or cfg.fuelThreshold or cfg.minFuel or DEFAULT_THRESHOLD
+    state.reserve = state.reserve or cfg.fuelReserve or math.max(DEFAULT_RESERVE, state.threshold * 2)
+    state.fuelItems = state.fuelItems or (cfg.fuelItems and #cfg.fuelItems > 0 and table_utils.copyArray(cfg.fuelItems)) or table_utils.copyArray(DEFAULT_FUEL_ITEMS)
+    state.sides = state.sides or (cfg.fuelChestSides and #cfg.fuelChestSides > 0 and table_utils.copyArray(cfg.fuelChestSides)) or table_utils.copyArray(DEFAULT_SIDES)
+    state.cycleLimit = state.cycleLimit or cfg.fuelCycleLimit or cfg.inventoryCycleLimit or 192
     state.history = state.history or {}
     state.serviceActive = state.serviceActive or false
     state.lastLevel = state.lastLevel or nil
@@ -158,17 +93,17 @@ end
 local function resolveSides(state, opts)
     opts = opts or {}
     if type(opts.sides) == "table" and #opts.sides > 0 then
-        return copyArray(opts.sides)
+        return table_utils.copyArray(opts.sides)
     end
-    return copyArray(state.sides)
+    return table_utils.copyArray(state.sides)
 end
 
 local function resolveFuelItems(state, opts)
     opts = opts or {}
     if type(opts.fuelItems) == "table" and #opts.fuelItems > 0 then
-        return copyArray(opts.fuelItems)
+        return table_utils.copyArray(opts.fuelItems)
     end
-    return copyArray(state.fuelItems)
+    return table_utils.copyArray(state.fuelItems)
 end
 
 local function recordHistory(state, entry)
@@ -260,10 +195,10 @@ local function pullFromSources(ctx, state, opts)
             })
             if ok then
                 pulled[#pulled + 1] = { side = side, material = material }
-                log(ctx, "debug", string.format("Pulled %s from %s", material, side))
+                logger.log(ctx, "debug", string.format("Pulled %s from %s", material, side))
             elseif err ~= "missing_material" then
                 errors[#errors + 1] = { side = side, material = material, error = err }
-                log(ctx, "warn", string.format("Pull %s from %s failed: %s", material, side, tostring(err)))
+                logger.log(ctx, "warn", string.format("Pull %s from %s failed: %s", material, side, tostring(err)))
             end
         end
         if attempts >= maxAttempts then
@@ -274,6 +209,55 @@ local function pullFromSources(ctx, state, opts)
         inventory.invalidate(ctx)
     end
     return #pulled > 0, { pulled = pulled, errors = errors }
+end
+
+local function refuelRound(ctx, target, report)
+    local consumed, info = consumeFromInventory(ctx, target)
+    report.steps[#report.steps + 1] = {
+        type = "inventory",
+        round = report.round,
+        success = consumed,
+        info = info,
+    }
+    if consumed then
+        logger.log(ctx, "debug", string.format("Consumed %d fuel items from inventory", table_utils.sumValues(info and info.consumed)))
+    end
+    local level = select(1, readFuel())
+    if level and level >= target and target > 0 then
+        report.finalLevel = level
+        report.reachedTarget = true
+        return true, report
+    end
+
+    local pulled, pullInfo = pullFromSources(ctx, state, opts)
+    report.steps[#report.steps + 1] = {
+        type = "pull",
+        round = report.round,
+        success = pulled,
+        info = pullInfo,
+    }
+
+    if pulled then
+        local consumedAfterPull, postInfo = consumeFromInventory(ctx, target)
+        report.steps[#report.steps + 1] = {
+            type = "inventory",
+            stage = "post_pull",
+            round = report.round,
+            success = consumedAfterPull,
+            info = postInfo,
+        }
+        if consumedAfterPull then
+            logger.log(ctx, "debug", string.format("Post-pull consumption used %d fuel items", table_utils.sumValues(postInfo and postInfo.consumed)))
+            local postLevel = select(1, readFuel())
+            if postLevel and postLevel >= target and target > 0 then
+                report.finalLevel = postLevel
+                report.reachedTarget = true
+                return true, report
+            end
+        end
+    end
+
+    return (pulled or consumed), report
 end
 
 local function refuelInternal(ctx, state, opts)
@@ -308,53 +292,14 @@ local function refuelInternal(ctx, state, opts)
         rounds = 1
     end
 
-    for round = 1, rounds do
-        local consumed, info = consumeFromInventory(ctx, target)
-        report.steps[#report.steps + 1] = {
-            type = "inventory",
-            round = round,
-            success = consumed,
-            info = info,
-        }
-        if consumed then
-            log(ctx, "debug", string.format("Consumed %d fuel items from inventory", sumValues(info and info.consumed)))
-        end
-        local level = select(1, readFuel())
-        if level and level >= target and target > 0 then
-            report.finalLevel = level
-            report.reachedTarget = true
+    for i = 1, rounds do
+        report.round = i
+        local ok, roundReport = refuelRound(ctx, target, report)
+        report = roundReport
+        if report.reachedTarget then
             return true, report
         end
-
-        local pulled, pullInfo = pullFromSources(ctx, state, opts)
-        report.steps[#report.steps + 1] = {
-            type = "pull",
-            round = round,
-            success = pulled,
-            info = pullInfo,
-        }
-
-        if pulled then
-            local consumedAfterPull, postInfo = consumeFromInventory(ctx, target)
-            report.steps[#report.steps + 1] = {
-                type = "inventory",
-                stage = "post_pull",
-                round = round,
-                success = consumedAfterPull,
-                info = postInfo,
-            }
-            if consumedAfterPull then
-                log(ctx, "debug", string.format("Post-pull consumption used %d fuel items", sumValues(postInfo and postInfo.consumed)))
-                local postLevel = select(1, readFuel())
-                if postLevel and postLevel >= target and target > 0 then
-                    report.finalLevel = postLevel
-                    report.reachedTarget = true
-                    return true, report
-                end
-            end
-        end
-
-        if not pulled and not consumed then
+        if not ok then
             break
         end
     end
@@ -411,9 +356,9 @@ function fuel.refuel(ctx, opts)
         report = report,
     })
     if ok then
-        log(ctx, "info", string.format("Refuel complete (fuel=%s)", tostring(report.finalLevel or "unknown")))
+        logger.log(ctx, "info", string.format("Refuel complete (fuel=%s)", tostring(report.finalLevel or "unknown")))
     else
-        log(ctx, "warn", "Refuel attempt did not reach target level")
+        logger.log(ctx, "warn", "Refuel attempt did not reach target level")
     end
     return ok, report
 end
@@ -433,6 +378,70 @@ function fuel.ensure(ctx, opts)
         return false, report
     end
     return fuel.check(ctx, opts)
+end
+
+local function bootstrapFuel(ctx, state, opts, report)
+    logger.log(ctx, "warn", "Fuel depleted; attempting to consume onboard fuel before navigating")
+    local minimumMove = opts and opts.minimumMoveFuel or math.max(10, state.threshold or 0)
+    if minimumMove <= 0 then
+        minimumMove = 10
+    end
+    local consumed, info = consumeFromInventory(ctx, minimumMove)
+    report.steps[#report.steps + 1] = {
+        type = "inventory",
+        stage = "bootstrap",
+        success = consumed,
+        info = info,
+    }
+    local level = select(1, readFuel()) or (info and info.endLevel) or report.startLevel
+    report.bootstrapLevel = level
+    if level <= 0 then
+        logger.log(ctx, "error", "Fuel depleted; cannot move to origin")
+        report.error = "out_of_fuel"
+        report.finalLevel = level
+        return false, report
+    end
+    return true, report
+end
+
+local function runService(ctx, state, opts, report)
+    state.serviceActive = true
+    logger.log(ctx, "info", "Entering SERVICE mode: returning to origin for refuel")
+
+    local ok, err = movement.returnToOrigin(ctx, opts and opts.navigation)
+    if not ok then
+        state.serviceActive = false
+        logger.log(ctx, "error", "SERVICE return failed: " .. tostring(err))
+        report.returnError = err
+        return false, report
+    end
+    report.steps[#report.steps + 1] = { type = "return", success = true }
+
+    local refuelOk, refuelReport = refuelInternal(ctx, state, opts)
+    report.steps[#report.steps + 1] = {
+        type = "refuel",
+        success = refuelOk,
+        report = refuelReport,
+    }
+
+    state.serviceActive = false
+    recordHistory(state, {
+        type = "service",
+        timestamp = os and os.time and os.time() or nil,
+        success = refuelOk,
+        report = report,
+    })
+
+    if not refuelOk then
+        logger.log(ctx, "warn", "SERVICE refuel did not reach target level")
+        report.finalLevel = select(1, readFuel()) or (refuelReport and refuelReport.finalLevel) or report.startLevel
+        return false, report
+    end
+
+    local finalLevel = select(1, readFuel()) or refuelReport.finalLevel
+    report.finalLevel = finalLevel
+    logger.log(ctx, "info", string.format("SERVICE complete (fuel=%s)", tostring(finalLevel or "unknown")))
+    return true, report
 end
 
 function fuel.service(ctx, opts)
@@ -457,71 +466,111 @@ function fuel.service(ctx, opts)
     end
 
     if not level then
-        log(ctx, "warn", "Fuel level unavailable; skipping service")
+        logger.log(ctx, "warn", "Fuel level unavailable; skipping service")
         report.error = "fuel_unreadable"
         return false, report
     end
 
     if level <= 0 then
-        log(ctx, "warn", "Fuel depleted; attempting to consume onboard fuel before navigating")
-        local minimumMove = opts and opts.minimumMoveFuel or math.max(10, state.threshold or 0)
-        if minimumMove <= 0 then
-            minimumMove = 10
+        local ok, bootstrapReport = bootstrapFuel(ctx, state, opts, report)
+        if not ok then
+            return false, bootstrapReport
         end
-        local consumed, info = consumeFromInventory(ctx, minimumMove)
-        report.steps[#report.steps + 1] = {
-            type = "inventory",
-            stage = "bootstrap",
-            success = consumed,
-            info = info,
-        }
-        level = select(1, readFuel()) or (info and info.endLevel) or level
-        report.bootstrapLevel = level
-        if level <= 0 then
-            log(ctx, "error", "Fuel depleted; cannot move to origin")
-            report.error = "out_of_fuel"
-            report.finalLevel = level
-            return false, report
+        report = bootstrapReport
+    end
+
+    return runService(ctx, state, opts, report)
+end
+
+function fuel.resolveFuelThreshold(ctx)
+    local threshold = 0
+    local function consider(value)
+        if type(value) == "number" and value > threshold then
+            threshold = value
         end
     end
-
-    state.serviceActive = true
-    log(ctx, "info", "Entering SERVICE mode: returning to origin for refuel")
-
-    local ok, err = movement.returnToOrigin(ctx, opts and opts.navigation)
-    if not ok then
-        state.serviceActive = false
-        log(ctx, "error", "SERVICE return failed: " .. tostring(err))
-        report.returnError = err
-        return false, report
+    if type(ctx.fuelState) == "table" then
+        local fuel = ctx.fuelState
+        consider(fuel.threshold)
+        consider(fuel.reserve)
+        consider(fuel.min)
+        consider(fuel.minFuel)
+        consider(fuel.low)
     end
-    report.steps[#report.steps + 1] = { type = "return", success = true }
-
-    local refuelOk, refuelReport = refuelInternal(ctx, state, opts)
-    report.steps[#report.steps + 1] = {
-        type = "refuel",
-        success = refuelOk,
-        report = refuelReport,
-    }
-
-    state.serviceActive = false
-    recordHistory(state, {
-        type = "service",
-        timestamp = os and os.time and os.time() or nil,
-        success = refuelOk,
-        report = report,
-    })
-
-    if not refuelOk then
-        log(ctx, "warn", "SERVICE refuel did not reach target level")
-        report.finalLevel = select(1, readFuel()) or (refuelReport and refuelReport.finalLevel) or level
-        return false, report
+    if type(ctx.config) == "table" then
+        local cfg = ctx.config
+        consider(cfg.fuelThreshold)
+        consider(cfg.fuelReserve)
+        consider(cfg.minFuel)
     end
+    return threshold
+end
 
-    local finalLevel = select(1, readFuel()) or refuelReport.finalLevel
-    report.finalLevel = finalLevel
-    log(ctx, "info", string.format("SERVICE complete (fuel=%s)", tostring(finalLevel or "unknown")))
-    return true, report
+function fuel.isFuelLow(ctx)
+    if not turtle or not turtle.getFuelLevel then
+        return false
+    end
+    local level = turtle.getFuelLevel()
+    if level == "unlimited" then
+        return false
+    end
+    if type(level) ~= "number" then
+        return false
+    end
+    local threshold = fuel.resolveFuelThreshold(ctx)
+    if threshold <= 0 then
+        return false
+    end
+    return level <= threshold
+endfunction fuel.describeFuel(io, report)
+    if not io.print then
+        return
+    end
+    if report.unlimited then
+        io.print("Fuel: unlimited")
+        return
+    end
+    local levelText = report.level and tostring(report.level) or "unknown"
+    local limitText = report.limit and ("/" .. tostring(report.limit)) or ""
+    io.print(string.format("Fuel level: %s%s", levelText, limitText))
+    if report.threshold then
+        io.print(string.format("Threshold: %d", report.threshold))
+    end
+    if report.reserve then
+        io.print(string.format("Reserve target: %d", report.reserve))
+    end
+    if report.needsService then
+        io.print("Status: below threshold (service required)")
+    else
+        io.print("Status: sufficient for now")
+    end
+end
+
+function fuel.describeService(io, report)
+    if not io.print then
+        return
+    end
+    if not report then
+        io.print("No service report available.")
+        return
+    end
+    if report.returnError then
+        io.print("Return-to-origin failed: " .. tostring(report.returnError))
+    end
+    if report.steps then
+        for _, step in ipairs(report.steps) do
+            if step.type == "return" then
+                io.print("Return to origin: " .. (step.success and "OK" or "FAIL"))
+            elseif step.type == "refuel" then
+                local info = step.report or {}
+                local final = info.finalLevel ~= nil and info.finalLevel or (info.endLevel or "unknown")
+                io.print(string.format("Refuel step: %s (final=%s)", step.success and "OK" or "FAIL", tostring(final)))
+            end
+        end
+    end
+    if report.finalLevel then
+        io.print("Service final fuel level: " .. tostring(report.finalLevel))
+    end
 end
 
 return fuel

@@ -8,6 +8,11 @@ state transition hints, following the project conventions.
 ---@diagnostic disable: undefined-global
 
 local placement = {}
+local logger = require("lib_logger")
+local world = require("lib_world")
+local fuel = require("lib_fuel")
+local schema_utils = require("lib_schema")
+local strategy_utils = require("lib_strategy")
 
 local SIDE_APIS = {
     forward = {
@@ -33,35 +38,6 @@ local SIDE_APIS = {
     },
 }
 
-local function copyPosition(pos)
-    if type(pos) ~= "table" then
-        return nil
-    end
-    return {
-        x = pos.x or 0,
-        y = pos.y or 0,
-        z = pos.z or 0,
-    }
-end
-
-local function log(ctx, level, message)
-    if type(ctx) ~= "table" then
-        return
-    end
-    local logger = ctx.logger
-    if type(logger) ~= "table" then
-        return
-    end
-    local fn = logger[level]
-    if type(fn) == "function" then
-        fn(message)
-        return
-    end
-    if type(logger.log) == "function" then
-        logger.log(level, message)
-    end
-end
-
 local function ensurePlacementState(ctx)
     if type(ctx) ~= "table" then
         error("placement library requires a context table", 2)
@@ -70,133 +46,6 @@ local function ensurePlacementState(ctx)
     local state = ctx.placement
     state.cachedSlots = state.cachedSlots or {}
     return state
-end
-
-local function resolveFuelThreshold(ctx)
-    local threshold = 0
-    local function consider(value)
-        if type(value) == "number" and value > threshold then
-            threshold = value
-        end
-    end
-    if type(ctx.fuelState) == "table" then
-        local fuel = ctx.fuelState
-        consider(fuel.threshold)
-        consider(fuel.reserve)
-        consider(fuel.min)
-        consider(fuel.minFuel)
-        consider(fuel.low)
-    end
-    if type(ctx.config) == "table" then
-        local cfg = ctx.config
-        consider(cfg.fuelThreshold)
-        consider(cfg.fuelReserve)
-        consider(cfg.minFuel)
-    end
-    return threshold
-end
-
-local function isFuelLow(ctx)
-    if not turtle or not turtle.getFuelLevel then
-        return false
-    end
-    local level = turtle.getFuelLevel()
-    if level == "unlimited" then
-        return false
-    end
-    if type(level) ~= "number" then
-        return false
-    end
-    local threshold = resolveFuelThreshold(ctx)
-    if threshold <= 0 then
-        return false
-    end
-    return level <= threshold
-end
-
-local function fetchSchemaEntry(schema, pos)
-    if type(schema) ~= "table" or type(pos) ~= "table" then
-        return nil, "missing_schema"
-    end
-    local xLayer = schema[pos.x] or schema[tostring(pos.x)]
-    if type(xLayer) ~= "table" then
-        return nil, "empty"
-    end
-    local yLayer = xLayer[pos.y] or xLayer[tostring(pos.y)]
-    if type(yLayer) ~= "table" then
-        return nil, "empty"
-    end
-    local block = yLayer[pos.z] or yLayer[tostring(pos.z)]
-    if block == nil then
-        return nil, "empty"
-    end
-    return block
-end
-
-local function ensurePointer(ctx)
-    if type(ctx.pointer) == "table" then
-        return ctx.pointer
-    end
-    local strategy = ctx.strategy
-    if type(strategy) == "table" and type(strategy.order) == "table" then
-        local idx = strategy.index or 1
-        local pos = strategy.order[idx]
-        if pos then
-            ctx.pointer = copyPosition(pos)
-            strategy.index = idx
-            return ctx.pointer
-        end
-        return nil, "strategy_exhausted"
-    end
-    return nil, "no_pointer"
-end
-
-local function advancePointer(ctx)
-    if type(ctx.strategy) == "table" then
-        local strategy = ctx.strategy
-        if type(strategy.advance) == "function" then
-            local nextPos, doneFlag = strategy.advance(strategy, ctx)
-            if nextPos then
-                ctx.pointer = copyPosition(nextPos)
-                return true
-            end
-            if doneFlag == false then
-                return false
-            end
-            ctx.pointer = nil
-            return false
-        end
-        if type(strategy.next) == "function" then
-            local nextPos = strategy.next(strategy, ctx)
-            if nextPos then
-                ctx.pointer = copyPosition(nextPos)
-                return true
-            end
-            ctx.pointer = nil
-            return false
-        end
-        if type(strategy.order) == "table" then
-            local idx = (strategy.index or 1) + 1
-            strategy.index = idx
-            local pos = strategy.order[idx]
-            if pos then
-                ctx.pointer = copyPosition(pos)
-                return true
-            end
-            ctx.pointer = nil
-            return false
-        end
-    elseif type(ctx.strategy) == "function" then
-        local nextPos = ctx.strategy(ctx)
-        if nextPos then
-            ctx.pointer = copyPosition(nextPos)
-            return true
-        end
-        ctx.pointer = nil
-        return false
-    end
-    ctx.pointer = nil
-    return false
 end
 
 local function selectMaterialSlot(ctx, material)
@@ -386,7 +235,7 @@ function placement.placeMaterial(ctx, material, opts)
     local placed, placeErr = sideFns.place()
     if not placed then
         if placeErr then
-            log(ctx, "debug", string.format("Place failed for %s: %s", material, placeErr))
+            logger.log(ctx, "debug", string.format("Place failed for %s: %s", material, placeErr))
         end
 
         local stillBlocked = type(sideFns.detect) == "function" and sideFns.detect()
@@ -438,7 +287,7 @@ function placement.placeMaterial(ctx, material, opts)
 end
 
 function placement.advancePointer(ctx)
-    return advancePointer(ctx)
+    return strategy_utils.advancePointer(ctx)
 end
 
 function placement.ensureState(ctx)
@@ -449,21 +298,21 @@ function placement.executeBuildState(ctx, opts)
     opts = opts or {}
     local state = ensurePlacementState(ctx)
 
-    local pointer, pointerErr = ensurePointer(ctx)
+    local pointer, pointerErr = strategy_utils.ensurePointer(ctx)
     if not pointer then
-        log(ctx, "debug", "No build pointer available: " .. tostring(pointerErr))
+        logger.log(ctx, "debug", "No build pointer available: " .. tostring(pointerErr))
         return "DONE", { reason = pointerErr or "no_pointer" }
     end
 
-    if isFuelLow(ctx) then
+    if fuel.isFuelLow(ctx) then
         state.resumeState = "BUILD"
-        log(ctx, "info", "Fuel below threshold, switching to REFUEL")
-        return "REFUEL", { reason = "fuel_low", pointer = copyPosition(pointer) }
+        logger.log(ctx, "info", "Fuel below threshold, switching to REFUEL")
+        return "REFUEL", { reason = "fuel_low", pointer = world.copyPosition(pointer) }
     end
 
-    local block, schemaErr = fetchSchemaEntry(ctx.schema, pointer)
+    local block, schemaErr = schema_utils.fetchSchemaEntry(ctx.schema, pointer)
     if not block then
-        log(ctx, "debug", string.format("No schema entry at x=%d y=%d z=%d (%s)", pointer.x or 0, pointer.y or 0, pointer.z or 0, tostring(schemaErr)))
+        logger.log(ctx, "debug", string.format("No schema entry at x=%d y=%d z=%d (%s)", pointer.x or 0, pointer.y or 0, pointer.z or 0, tostring(schemaErr)))
         local autoAdvance = opts.autoAdvance
         if autoAdvance == nil then
             autoAdvance = true
@@ -471,7 +320,7 @@ function placement.executeBuildState(ctx, opts)
         if autoAdvance then
             local advanced = placement.advancePointer(ctx)
             if advanced then
-                return "BUILD", { reason = "skip_empty", pointer = copyPosition(ctx.pointer) }
+                return "BUILD", { reason = "skip_empty", pointer = world.copyPosition(ctx.pointer) }
             end
         end
         return "DONE", { reason = "schema_exhausted" }
@@ -485,7 +334,7 @@ function placement.executeBuildState(ctx, opts)
         if autoAdvance then
             local advanced = placement.advancePointer(ctx)
             if advanced then
-                return "BUILD", { reason = "skip_air", pointer = copyPosition(ctx.pointer) }
+                return "BUILD", { reason = "skip_air", pointer = world.copyPosition(ctx.pointer) }
             end
         end
         return "DONE", { reason = "no_material" }
@@ -515,19 +364,19 @@ function placement.executeBuildState(ctx, opts)
         if err == "missing_material" then
             state.resumeState = "BUILD"
             state.pendingMaterial = block.material
-            log(ctx, "warn", string.format("Need to restock %s", block.material))
+            logger.log(ctx, "warn", string.format("Need to restock %s", block.material))
             return "RESTOCK", {
                 reason = err,
                 material = block.material,
-                pointer = copyPosition(pointer),
+                pointer = world.copyPosition(pointer),
             }
         end
         if err == "blocked" then
             state.resumeState = "BUILD"
-            log(ctx, "warn", "Placement blocked; invoking BLOCKED state")
+            logger.log(ctx, "warn", "Placement blocked; invoking BLOCKED state")
             return "BLOCKED", {
                 reason = err,
-                pointer = copyPosition(pointer),
+                pointer = world.copyPosition(pointer),
                 material = block.material,
             }
         end
@@ -536,17 +385,17 @@ function placement.executeBuildState(ctx, opts)
             return "ERROR", { reason = err }
         end
         state.lastError = err
-        log(ctx, "error", string.format("Placement failed for %s: %s", block.material, tostring(err)))
+        logger.log(ctx, "error", string.format("Placement failed for %s: %s", block.material, tostring(err)))
         return "ERROR", {
             reason = err,
             material = block.material,
-            pointer = copyPosition(pointer),
+            pointer = world.copyPosition(pointer),
         }
     end
 
     state.lastPlaced = {
         material = block.material,
-        pointer = copyPosition(pointer),
+        pointer = world.copyPosition(pointer),
         side = side,
         meta = block.meta,
         timestamp = os and os.time and os.time() or nil,
@@ -559,7 +408,7 @@ function placement.executeBuildState(ctx, opts)
     if autoAdvance then
         local advanced = placement.advancePointer(ctx)
         if advanced then
-            return "BUILD", { reason = "continue", pointer = copyPosition(ctx.pointer) }
+            return "BUILD", { reason = "continue", pointer = world.copyPosition(ctx.pointer) }
         end
         return "DONE", { reason = "complete" }
     end

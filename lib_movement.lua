@@ -8,6 +8,7 @@ with optional error messages.
 ---@diagnostic disable: undefined-global, undefined-field
 
 local movement = {}
+local logger = require("lib_logger")
 
 local CARDINALS = {"north", "east", "south", "west"}
 local DIRECTION_VECTORS = {
@@ -222,22 +223,6 @@ local function tryInspect(inspectFn)
     return nil
 end
 
-local function log(ctx, level, message)
-    if not ctx then
-        return
-    end
-    local logger = ctx.logger
-    if not logger then
-        return
-    end
-
-    if type(logger[level]) == "function" then
-        logger[level](message)
-    elseif type(logger.log) == "function" then
-        logger.log(level, message)
-    end
-end
-
 local function ensureMovementState(ctx)
     if type(ctx) ~= "table" then
         error("movement library requires a context table", 2)
@@ -310,7 +295,7 @@ function movement.setFacing(ctx, facing)
         return false, "unknown facing: " .. tostring(facing)
     end
     state.facing = canonical
-    log(ctx, "debug", "Set facing to " .. canonical)
+    logger.log(ctx, "debug", "Set facing to " .. canonical)
     return true
 end
 
@@ -358,7 +343,7 @@ local function turn(ctx, direction)
     end
 
     state.facing = CARDINALS[index]
-    log(ctx, "debug", "Turned " .. direction .. ", now facing " .. state.facing)
+    logger.log(ctx, "debug", "Turned " .. direction .. ", now facing " .. state.facing)
     return true
 end
 
@@ -478,7 +463,7 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
 
         if moveFns.move() then
             state.position = targetPos
-            log(ctx, "debug", string.format("Moved to x=%d y=%d z=%d", state.position.x, state.position.y, state.position.z))
+            logger.log(ctx, "debug", string.format("Moved to x=%d y=%d z=%d", state.position.x, state.position.y, state.position.z))
             return true
         end
 
@@ -487,7 +472,7 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
         if allowAttack and moveFns.attack then
             if moveFns.attack() then
                 handled = true
-                log(ctx, "debug", "Attacked entity blocking movement")
+                logger.log(ctx, "debug", "Attacked entity blocking movement")
             end
         end
 
@@ -523,7 +508,7 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
                 handled = true
                 if softBlock then
                     local foundName = inspectData and inspectData.name or "unknown"
-                    log(ctx, "debug", string.format(
+                    logger.log(ctx, "debug", string.format(
                         "Cleared soft obstruction %s at x=%d y=%d z=%d",
                         tostring(foundName),
                         targetPos.x or 0,
@@ -532,7 +517,7 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
                     ))
                 elseif plannedMaterial then
                     local foundName = inspectData and inspectData.name or "unknown"
-                    log(ctx, "debug", string.format(
+                    logger.log(ctx, "debug", string.format(
                         "Cleared mismatched block %s (expected %s) at x=%d y=%d z=%d",
                         tostring(foundName),
                         tostring(plannedMaterial),
@@ -543,7 +528,7 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
                 else
                     local foundName = inspectData and inspectData.name
                     if foundName then
-                        log(ctx, "debug", string.format(
+                        logger.log(ctx, "debug", string.format(
                             "Dug blocking block %s at x=%d y=%d z=%d",
                             foundName,
                             targetPos.x or 0,
@@ -551,7 +536,7 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
                             targetPos.z or 0
                         ))
                     else
-                        log(ctx, "debug", string.format(
+                        logger.log(ctx, "debug", string.format(
                             "Dug blocking block at x=%d y=%d z=%d",
                             targetPos.x or 0,
                             targetPos.y or 0,
@@ -560,7 +545,7 @@ local function moveWithRetries(ctx, opts, moveFns, delta)
                     end
                 end
             elseif plannedMaterial and not canClear and allowDig then
-                log(ctx, "debug", string.format(
+                logger.log(ctx, "debug", string.format(
                     "Preserving planned block %s at x=%d y=%d z=%d",
                     tostring(plannedMaterial),
                     targetPos.x or 0,
@@ -727,6 +712,45 @@ function movement.returnToOrigin(ctx, opts)
     end
 
     return true
+end
+
+function movement.turnLeftOf(facing)
+    facing = world.normaliseFacing(facing)
+    if facing == "north" then
+        return "west"
+    elseif facing == "west" then
+        return "south"
+    elseif facing == "south" then
+        return "east"
+    else -- east
+        return "north"
+    end
+end
+
+function movement.turnRightOf(facing)
+    facing = world.normaliseFacing(facing)
+    if facing == "north" then
+        return "east"
+    elseif facing == "east" then
+        return "south"
+    elseif facing == "south" then
+        return "west"
+    else -- west
+        return "north"
+    end
+end
+
+function movement.turnBackOf(facing)
+    facing = world.normaliseFacing(facing)
+    if facing == "north" then
+        return "south"
+    elseif facing == "south" then
+        return "north"
+    elseif facing == "east" then
+        return "west"
+    else -- west
+        return "east"
+    end
 end
 
 return movement

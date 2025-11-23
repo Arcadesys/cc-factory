@@ -10,6 +10,7 @@ local fuel = require("lib_fuel")
 local movement = require("lib_movement")
 local inventory = require("lib_inventory")
 local common = require("harness_common")
+local reporter = require("lib_reporter")
 
 local DEFAULT_CONTEXT = {
     origin = { x = 0, y = 0, z = 0 },
@@ -22,57 +23,6 @@ local DEFAULT_CONTEXT = {
         attackOnMove = false,
     },
 }
-
-local function describeFuel(io, report)
-    if not io.print then
-        return
-    end
-    if report.unlimited then
-        io.print("Fuel: unlimited")
-        return
-    end
-    local levelText = report.level and tostring(report.level) or "unknown"
-    local limitText = report.limit and ("/" .. tostring(report.limit)) or ""
-    io.print(string.format("Fuel level: %s%s", levelText, limitText))
-    if report.threshold then
-        io.print(string.format("Threshold: %d", report.threshold))
-    end
-    if report.reserve then
-        io.print(string.format("Reserve target: %d", report.reserve))
-    end
-    if report.needsService then
-        io.print("Status: below threshold (service required)")
-    else
-        io.print("Status: sufficient for now")
-    end
-end
-
-local function describeService(io, report)
-    if not io.print then
-        return
-    end
-    if not report then
-        io.print("No service report available.")
-        return
-    end
-    if report.returnError then
-        io.print("Return-to-origin failed: " .. tostring(report.returnError))
-    end
-    if report.steps then
-        for _, step in ipairs(report.steps) do
-            if step.type == "return" then
-                io.print("Return to origin: " .. (step.success and "OK" or "FAIL"))
-            elseif step.type == "refuel" then
-                local info = step.report or {}
-                local final = info.finalLevel ~= nil and info.finalLevel or (info.endLevel or "unknown")
-                io.print(string.format("Refuel step: %s (final=%s)", step.success and "OK" or "FAIL", tostring(final)))
-            end
-        end
-    end
-    if report.finalLevel then
-        io.print("Service final fuel level: " .. tostring(report.finalLevel))
-    end
-end
 
 local function ensureOriginPose(ctx)
     local pos = movement.getPosition(ctx)
@@ -111,37 +61,16 @@ local function ensureOnboardFuel(ctx, io)
     return hasFuel()
 end
 
-local function run(ctxOverrides, ioOverrides)
-    if not turtle then
-        error("Run this harness on a turtle.")
-    end
-
-    local io = common.resolveIo(ioOverrides)
-    local ctx = common.merge(DEFAULT_CONTEXT, ctxOverrides or {})
-    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
-
-    inventory.ensureState(ctx)
-    movement.ensureState(ctx)
-    movement.setPosition(ctx, ctx.origin)
-    fuel.ensureState(ctx)
-
-    if io.print then
-        io.print("Fuel harness starting.")
-        io.print("Ensure the turtle starts at origin facing north with a clear path back to origin.")
-        io.print("Place a chest containing turtle fuel (coal, charcoal, lava buckets, etc.) on one of the configured sides.")
-    end
-
-    common.promptEnter(io, "Press Enter when the supply chest is ready.")
-
-    local suite = common.createSuite({ name = "Fuel Harness", io = io })
-
-    suite:step("Baseline fuel status", function()
+local function stepBaselineFuelStatus(ctx, io)
+    return function()
         local _, report = fuel.check(ctx, {})
-        describeFuel(io, report)
+        reporter.describeFuel(io, report)
         return true
-    end)
+    end
+end
 
-    suite:step("Initial refuel attempt", function()
+local function stepInitialRefuelAttempt(ctx, io)
+    return function()
         local _, status = fuel.check(ctx, {})
         if status.unlimited then
             if io.print then
@@ -174,17 +103,19 @@ local function run(ctxOverrides, ioOverrides)
         end
 
         local ok, serviceReport = fuel.service(ctx, { target = target, rounds = 4 })
-        describeService(io, serviceReport)
+        reporter.describeService(io, serviceReport)
         if not ok then
             return false, serviceReport and (serviceReport.returnError or serviceReport.error or "service_failed") or "service_failed"
         end
 
         local _, after = fuel.check(ctx, {})
-        describeFuel(io, after)
+        reporter.describeFuel(io, after)
         return true
-    end)
+    end
+end
 
-    suite:step("Move turtle away from origin", function()
+local function stepMoveTurtleAwayFromOrigin(ctx, io)
+    return function()
         local ok, err = movement.goTo(ctx, { x = 2, y = 0, z = 1 }, {
             axisOrder = { "x", "z", "y" },
             dig = false,
@@ -197,9 +128,11 @@ local function run(ctxOverrides, ioOverrides)
             io.print("Turtle moved to " .. ensureOriginPose(ctx))
         end
         return true
-    end)
+    end
+end
 
-    suite:step("Refuel using onboard items away from chest", function()
+local function stepRefuelUsingOnboardItems(ctx, io)
+    return function()
         local pos = movement.getPosition(ctx)
         if pos.x == ctx.origin.x and pos.y == ctx.origin.y and pos.z == ctx.origin.z then
             return false, "turtle_not_away_from_origin"
@@ -228,11 +161,13 @@ local function run(ctxOverrides, ioOverrides)
         end
 
         local _, after = fuel.check(ctx, {})
-        describeFuel(io, after)
+        reporter.describeFuel(io, after)
         return true
-    end)
+    end
+end
 
-    suite:step("Trigger SERVICE routine", function()
+local function stepTriggerServiceRoutine(ctx, io)
+    return function()
         local _, status = fuel.check(ctx, {})
         local level = status.level or 0
         local target = level + math.max(40, ctx.fuelState and ctx.fuelState.threshold or 80)
@@ -240,17 +175,48 @@ local function run(ctxOverrides, ioOverrides)
             io.print(string.format("Requesting service to reach target fuel %d.", target))
         end
         local ok, serviceReport = fuel.service(ctx, { target = target, rounds = 4 })
-        describeService(io, serviceReport)
+        reporter.describeService(io, serviceReport)
         if not ok then
             return false, serviceReport and (serviceReport.returnError or "service_failed") or "service_failed"
         end
         local _, after = fuel.check(ctx, {})
-        describeFuel(io, after)
+        reporter.describeFuel(io, after)
         if io.print then
             io.print("Post-service pose: " .. ensureOriginPose(ctx))
         end
         return true
-    end)
+    end
+end
+
+local function run(ctxOverrides, ioOverrides)
+    if not turtle then
+        error("Run this harness on a turtle.")
+    end
+
+    local io = common.resolveIo(ioOverrides)
+    local ctx = common.merge(DEFAULT_CONTEXT, ctxOverrides or {})
+    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
+
+    inventory.ensureState(ctx)
+    movement.ensureState(ctx)
+    movement.setPosition(ctx, ctx.origin)
+    fuel.ensureState(ctx)
+
+    if io.print then
+        io.print("Fuel harness starting.")
+        io.print("Ensure the turtle starts at origin facing north with a clear path back to origin.")
+        io.print("Place a chest containing turtle fuel (coal, charcoal, lava buckets, etc.) on one of the configured sides.")
+    end
+
+    common.promptEnter(io, "Press Enter when the supply chest is ready.")
+
+    local suite = common.createSuite({ name = "Fuel Harness", io = io })
+
+    suite:step("Baseline fuel status", stepBaselineFuelStatus(ctx, io))
+    suite:step("Initial refuel attempt", stepInitialRefuelAttempt(ctx, io))
+    suite:step("Move turtle away from origin", stepMoveTurtleAwayFromOrigin(ctx, io))
+    suite:step("Refuel using onboard items away from chest", stepRefuelUsingOnboardItems(ctx, io))
+    suite:step("Trigger SERVICE routine", stepTriggerServiceRoutine(ctx, io))
 
     suite:summary()
     return suite

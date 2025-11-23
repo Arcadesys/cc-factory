@@ -18,13 +18,15 @@ This document explains the roles of each subsystem and agent.
 
 A shared table passed to every state and library. It contains:
 
-* `schema` — parsed representation (3D grid, layer list, etc.)
-* `pointer` — current build location within the schema
-* `origin` — absolute home coordinates
-* `inventoryState` — cached inventory info
-* `fuelState` — remaining fuel and thresholds
-* `config` — runtime settings (verbose, safety checks, etc.)
-* `state` — current state label
+* `schema` — parsed representation (3D grid).
+* `strategy` — linear list of build steps (computed by INITIALIZE).
+* `pointer` — index of the current step in `strategy`.
+* `origin` — absolute home coordinates and facing (`{x, y, z, facing}`).
+* `config` — runtime settings (verbose, schema path, etc.).
+* `state` — current state label.
+* `missingMaterial` — (transient) material causing a RESTOCK trigger.
+* `retries` — (transient) counter for navigation retry logic.
+* `lastError` — (transient) error message if state is ERROR.
 
 States must treat `ctx` as the single source of truth.
 
@@ -68,42 +70,44 @@ end
 
 ### 3.1 `INITIALIZE`
 
-* Load schema from file or network.
+* Load schema from file.
 * Parse into canonical format.
-* Compute build order (e.g., serpentine, optimized path, or custom strategy).
-* Populate `ctx.pointer` with initial coordinates.
-* Validate materials and inventory availability.
+* Compute **Build Strategy**: A linear list of steps (serpentine path).
+* Store strategy in `ctx.strategy` and set `ctx.pointer = 1`.
+* Transition to `BUILD`.
 
 ### 3.2 `BUILD`
 
-* Move to target coordinate.
-* Place the required material using safe placement logic.
-* If placement fails due to missing blocks → switch to `RESTOCK`.
-* If fuel below threshold → switch to `REFUEL`.
-* If navigation blocked → switch to `BLOCKED`.
-* Otherwise, advance pointer and continue.
+* **Check Fuel**: If low (< 100), transition to `REFUEL`.
+* **Check Inventory**: If missing required material, set `ctx.missingMaterial` and transition to `RESTOCK`.
+* **Move**: Navigate to the target coordinate (converting local strategy pos to world pos).
+  * If blocked, transition to `BLOCKED`.
+* **Place**: Attempt to place the block.
+  * If placement fails (obstruction), transition to `ERROR` (or retry logic).
+* **Advance**: Increment `ctx.pointer`.
+* If pointer > strategy length, transition to `DONE`.
 
 ### 3.3 `RESTOCK`
 
-* Return to origin.
-* Look up required item.
-* Attempt to pull a full stack from chest.
-* If absent → go to `ERROR`.
-* Return to previous state.
+* Return to `ctx.origin`.
+* Attempt to pull `ctx.missingMaterial` from any adjacent inventory (front, up, down, etc.).
+* If successful, clear `missingMaterial` and return to `BUILD`.
+* If failed (item not found), transition to `ERROR`.
 
 ### 3.4 `REFUEL`
 
-* Return to origin.
-* Pull available fuel items.
-* If absent → go to `ERROR`.
-* Refuel until threshold reached.
-* Return to previous state.
+* Return to `ctx.origin`.
+* Consume any fuel items currently in inventory.
+* (Optional) Pull fuel items from storage.
+* If fuel level is sufficient (> 1000), return to `BUILD`.
+* If still low, transition to `ERROR`.
 
 ### 3.5 `BLOCKED`
 
-* Attempt alternate pathfinding.
-* Retry movement with safety logic.
-* If still blocked after N retries → `ERROR`.
+* Wait for a short duration (5s).
+* Increment `ctx.retries`.
+* If retries > limit, transition to `ERROR`.
+* Otherwise, return to `BUILD` to retry movement.
 
 ### 3.6 `ERROR`
 
@@ -219,15 +223,3 @@ schema.json (or schema.txt)
 * Networked inventory management
 * On-turtle caching of material usage stats
 * Remote telemetry dashboard
-
----
-
-If you want, I can also generate:
-
-• a starter `main.lua`
-• templated state files
-• a canonical example `schema.json`
-• a test harness for parsing and movement
-• or an “agent kit”-style spec for how to prompt Codex to extend this system
-
-Just say what you want to tackle next.

@@ -10,6 +10,7 @@ local inventory = require("lib_inventory")
 local placement = require("lib_placement")
 local loggerLib = require("lib_logger")
 local fuelLib = require("lib_fuel")
+local orientation = require("lib_orientation")
 
 if not turtle then
     error("branchminer must run on a turtle")
@@ -97,27 +98,6 @@ local DEFAULT_FUEL_ITEMS = {
     "minecraft:lava_bucket",
     "minecraft:blaze_rod",
     "minecraft:dried_kelp_block",
-}
-
-local TURN_LEFT_OF = {
-    north = "west",
-    west = "south",
-    south = "east",
-    east = "north",
-}
-
-local TURN_RIGHT_OF = {
-    north = "east",
-    east = "south",
-    south = "west",
-    west = "north",
-}
-
-local TURN_BACK_OF = {
-    north = "south",
-    south = "north",
-    east = "west",
-    west = "east",
 }
 
 local ORE_TAG_HINTS = {

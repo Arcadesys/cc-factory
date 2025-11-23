@@ -27,6 +27,7 @@ local inventory = require("lib_inventory")
 local loggerLib = require("lib_logger")
 local initialize = require("lib_initialize")
 local fuelLib = require("lib_fuel")
+local orientation = require("lib_orientation")
 
 local HELP = [[
 3dprinter - quick-start schema builder
@@ -57,23 +58,10 @@ local START_ORIENTATIONS = {
 }
 local DEFAULT_ORIENTATION = 1
 
-local function resolveOrientationKey(raw)
-    if type(raw) == "string" then
-        local key = raw:lower()
-        if key == "forward_left" or key == "forward-left" or key == "left" or key == "l" then
-            return "forward_left"
-        elseif key == "forward_right" or key == "forward-right" or key == "right" or key == "r" then
-            return "forward_right"
-        end
-    elseif type(raw) == "number" and START_ORIENTATIONS[raw] then
-        return START_ORIENTATIONS[raw].key
-    end
-    return START_ORIENTATIONS[DEFAULT_ORIENTATION].key
-end
 
 local function computeLocalXZ(bounds, x, z, orientationKey)
     -- Map schema coordinates so every build starts one block forward and diagonally offset from the turtle.
-    local orientation = resolveOrientationKey(orientationKey)
+    local orientation = orientation.resolveOrientationKey(orientationKey)
     local relativeX = x - bounds.minX
     local relativeZ = z - bounds.minZ
     local localZ = - (relativeZ + 1)
@@ -84,86 +72,6 @@ local function computeLocalXZ(bounds, x, z, orientationKey)
         localX = - (relativeX + 1)
     end
     return localX, localZ
-end
-
-local function orientationLabel(key)
-    local resolved = resolveOrientationKey(key)
-    for _, entry in pairs(START_ORIENTATIONS) do
-        if entry.key == resolved then
-            return entry.label
-        end
-    end
-    return START_ORIENTATIONS[DEFAULT_ORIENTATION].label
-end
-
-local function normaliseFacing(facing)
-    facing = type(facing) == "string" and facing:lower() or "north"
-    if facing ~= "north" and facing ~= "east" and facing ~= "south" and facing ~= "west" then
-        return "north"
-    end
-    return facing
-end
-
-local function facingVectors(facing)
-    facing = normaliseFacing(facing)
-    if facing == "north" then
-        return { forward = { x = 0, z = -1 }, right = { x = 1, z = 0 } }
-    elseif facing == "east" then
-        return { forward = { x = 1, z = 0 }, right = { x = 0, z = 1 } }
-    elseif facing == "south" then
-        return { forward = { x = 0, z = 1 }, right = { x = -1, z = 0 } }
-    else -- west
-        return { forward = { x = -1, z = 0 }, right = { x = 0, z = -1 } }
-    end
-end
-
-local function rotateLocalOffset(localOffset, facing)
-    local vectors = facingVectors(facing)
-    local dx = localOffset.x or 0
-    local dz = localOffset.z or 0
-    local right = vectors.right
-    local forward = vectors.forward
-    return {
-        x = (right.x * dx) + (forward.x * (-dz)),
-        z = (right.z * dx) + (forward.z * (-dz)),
-    }
-end
-
-local function rotateWorldOffsetToLocal(worldOffset, facing)
-    facing = normaliseFacing(facing)
-    local dx = worldOffset and worldOffset.x or 0
-    local dz = worldOffset and worldOffset.z or 0
-    local result = {
-        x = 0,
-        y = worldOffset and worldOffset.y or 0,
-        z = 0,
-    }
-    if facing == "north" then
-        result.x = dx
-        result.z = dz
-    elseif facing == "east" then
-        result.x = dz
-        result.z = -dx
-    elseif facing == "south" then
-        result.x = -dx
-        result.z = -dz
-    else -- west
-        result.x = -dz
-        result.z = dx
-    end
-    return result
-end
-
-local function localToWorld(localOffset, facing)
-    facing = normaliseFacing(facing)
-    local dx = localOffset and localOffset.x or 0
-    local dz = localOffset and localOffset.z or 0
-    local rotated = rotateLocalOffset({ x = dx, z = dz }, facing)
-    return {
-        x = rotated.x,
-        y = localOffset and localOffset.y or 0,
-        z = rotated.z,
-    }
 end
 
 local function promptStartCell(opts, logger)
@@ -205,9 +113,9 @@ local function promptStartCell(opts, logger)
     end
 
     local choice = START_ORIENTATIONS[selection] or START_ORIENTATIONS[DEFAULT_ORIENTATION]
-    opts.orientation = resolveOrientationKey(choice.key or opts.orientation)
+    opts.orientation = orientation.resolveOrientationKey(choice.key or opts.orientation)
     opts.offsetLocal = opts.offsetLocal or { x = 0, y = 0, z = 0 }
-    opts.offset = localToWorld(opts.offsetLocal, opts.facing)
+    opts.offset = orientation.localToWorld(opts.offsetLocal, opts.facing)
     opts.startCell = selection
     if logger then
         logger:info(string.format("Using orientation %s", choice.label))
@@ -215,89 +123,9 @@ local function promptStartCell(opts, logger)
     opts.orientationLogged = true
 end
 
-local function detectFacingWithGps(logger)
-    if not gps or type(gps.locate) ~= "function" then
-        return nil, "gps_unavailable"
-    end
-    if not turtle or type(turtle.forward) ~= "function" or type(turtle.back) ~= "function" then
-        return nil, "turtle_api_unavailable"
-    end
-
-    local function locate(timeout)
-        local ok, x, y, z = pcall(gps.locate, timeout)
-        if ok and x then
-            return x, y, z
-        end
-        return nil, nil, nil
-    end
-
-    local x1, _, z1 = locate(0.5)
-    if not x1 then
-        x1, _, z1 = locate(1)
-        if not x1 then
-            return nil, "gps_initial_failed"
-        end
-    end
-
-    if not turtle.forward() then
-        return nil, "forward_blocked"
-    end
-
-    local x2, _, z2 = locate(0.5)
-    if not x2 then
-        x2, _, z2 = locate(1)
-    end
-
-    local returned = turtle.back()
-    if not returned then
-        local attempts = 0
-        while attempts < 5 and not returned do
-            returned = turtle.back()
-            attempts = attempts + 1
-            if not returned and sleep then
-                sleep(0)
-            end
-        end
-        if not returned then
-            if logger then
-                logger:warn("Facing detection failed to restore the turtle's start position; adjust the turtle manually and rerun.")
-            end
-            return nil, "return_failed"
-        end
-    end
-
-    if not x2 then
-        return nil, "gps_second_failed"
-    end
-
-    local dx = x2 - x1
-    local dz = z2 - z1
-    local threshold = 0.2
-
-    if math.abs(dx) < threshold and math.abs(dz) < threshold then
-        return nil, "gps_delta_small"
-    end
-
-    if math.abs(dx) >= math.abs(dz) then
-        if dx > threshold then
-            return "east"
-        elseif dx < -threshold then
-            return "west"
-        end
-    else
-        if dz > threshold then
-            return "south"
-        elseif dz < -threshold then
-        logger:info(string.format("Using orientation %s", choice.label))
-        end
-    end
-
-    return nil, "gps_delta_small"
-end
-
 local function resolveFacing(opts, logger)
     if opts.facingProvided then
-        opts.facing = normaliseFacing(opts.facing)
+        opts.facing = orientation.normaliseFacing(opts.facing)
         if not opts.facing and logger then
             logger:warn("Unknown facing provided; defaulting to north.")
         end
@@ -306,11 +134,11 @@ local function resolveFacing(opts, logger)
             logger:info("Dry run requested; skipping automatic facing detection. Using configured facing.")
         end
     else
-        local detected, reason = detectFacingWithGps(logger)
+        local detected, reason = orientation.detectFacingWithGps(logger)
         if detected then
-            opts.facing = normaliseFacing(detected)
+            opts.facing = orientation.normaliseFacing(detected)
             if logger and opts.facing then
-                logger:info(string.format("Detected turtle facing: %s (build will extend forward).", opts.facing))
+                logger:info(string.format("Detected turtle facing: %s (build will extend forward).")
             end
         else
             local manualFacing
@@ -326,7 +154,7 @@ local function resolveFacing(opts, logger)
                     if not response or response == "" then
                         break
                     end
-                    local normalised = normaliseFacing(response)
+                    local normalised = orientation.normaliseFacing(response)
                     if normalised then
                         manualFacing = normalised
                         break
@@ -342,7 +170,7 @@ local function resolveFacing(opts, logger)
                     logger:info(message)
                 end
             else
-                opts.facing = normaliseFacing(opts.facing)
+                opts.facing = orientation.normaliseFacing(opts.facing)
                 if not opts.facing then
                     opts.facing = "north"
                 end
@@ -370,7 +198,7 @@ local function resolveFacing(opts, logger)
         end
     end
 
-    opts.facing = normaliseFacing(opts.facing) or "north"
+    opts.facing = orientation.normaliseFacing(opts.facing) or "north"
 end
 
 local function parseArgs(raw)
@@ -667,7 +495,7 @@ local function buildOrder(schema, info, opts)
     local offsetXLocal = offsetLocal.x or 0
     local offsetYLocal = offsetLocal.y or 0
     local offsetZLocal = offsetLocal.z or 0
-    local orientation = resolveOrientationKey(opts.orientation)
+    orientation.resolveOrientationKey(opts.orientation)
 
     local order = {}
     for y = bounds.minY, bounds.maxY do
@@ -1382,7 +1210,7 @@ local function run(rawArgs)
     end
     opts.offset = localToWorld(opts.offsetLocal, opts.facing)
     if logger and not opts.orientationLogged then
-        logger:info(string.format("Orientation set to %s.", orientationLabel(opts.orientation)))
+        logger:info(string.format("Orientation set to %s.", orientation.orientationLabel(opts.orientation)))
     end
 
     local ctx = {

@@ -7,98 +7,9 @@ sample JSON, text-grid, and voxel inputs. Prompts allow testing custom files on 
 ---@diagnostic disable: undefined-global
 local parser = require("lib_parser")
 local common = require("harness_common")
-
-local createdArtifacts = {}
-
-local function stageArtifact(path)
-    for _, existing in ipairs(createdArtifacts) do
-        if existing == path then
-            return
-        end
-    end
-    createdArtifacts[#createdArtifacts + 1] = path
-end
-
-local function writeFile(path, contents)
-    if type(path) ~= "string" or path == "" then
-        return false, "invalid_path"
-    end
-    if fs and fs.open then
-        local handle = fs.open(path, "w")
-        if not handle then
-            return false, "open_failed"
-        end
-        handle.write(contents)
-        handle.close()
-        return true
-    end
-    if io and io.open then
-        local handle, err = io.open(path, "w")
-        if not handle then
-            return false, err or "open_failed"
-        end
-        handle:write(contents)
-        handle:close()
-        return true
-    end
-    return false, "fs_unavailable"
-end
-
-local function deleteFile(path)
-    if fs and fs.delete and fs.exists then
-        local ok, exists = pcall(fs.exists, path)
-        if ok and exists then
-            fs.delete(path)
-        end
-        return true
-    end
-    if os and os.remove then
-        os.remove(path)
-        return true
-    end
-    return false
-end
-
-local function cleanupArtifacts()
-    for index = #createdArtifacts, 1, -1 do
-        local path = createdArtifacts[index]
-        deleteFile(path)
-        createdArtifacts[index] = nil
-    end
-end
-
-local function printMaterials(io, info)
-    if not io.print then
-        return
-    end
-    if not info or not info.materials or #info.materials == 0 then
-        io.print("Materials: <none>")
-        return
-    end
-    io.print("Materials:")
-    for _, entry in ipairs(info.materials) do
-        io.print(string.format(" - %s x%d", entry.material, entry.count))
-    end
-end
-
-local function printBounds(io, info)
-    if not io.print then
-        return
-    end
-    if not info or not info.bounds or not info.bounds.min then
-        io.print("Bounds: <unknown>")
-        return
-    end
-    local minB = info.bounds.min
-    local maxB = info.bounds.max
-    local dims = {
-        x = (maxB.x - minB.x) + 1,
-        y = (maxB.y - minB.y) + 1,
-        z = (maxB.z - minB.z) + 1,
-    }
-    io.print(string.format("Bounds: min(%d,%d,%d) max(%d,%d,%d) dims(%d,%d,%d)",
-        minB.x, minB.y, minB.z, maxB.x, maxB.y, maxB.z, dims.x, dims.y, dims.z))
-end
+local reporter = require("lib_reporter")
+local fs_utils = require("lib_fs")
+local data = require("harness_parser_data")
 
 local function emitParseSummary(io, schema, info)
     if not io.print then
@@ -112,8 +23,8 @@ local function emitParseSummary(io, schema, info)
         io.print("Source: " .. tostring(info.path))
     end
     io.print("Total blocks: " .. tostring(info.totalBlocks or (schema and tostring(#schema) or 0)))
-    printBounds(io, info)
-    printMaterials(io, info)
+    reporter.printBounds(io, info)
+    reporter.printMaterials(io, info)
 end
 
 local function toMaterialMap(list)
@@ -169,149 +80,6 @@ local function checkExpectations(info, expect)
     return true
 end
 
-local SAMPLE_TEXT_GRID = [[
-legend:
-# = minecraft:cobblestone
-~ = minecraft:glass
-
-####
-#..#
-#..#
-####
-
-layer:1
-~..~
-.##.
-~..~
-]]
-
-local SAMPLE_JSON = [[
-{
-  "legend": {
-    "A": "minecraft:oak_planks",
-    "B": { "material": "minecraft:stone", "meta": { "variant": "smooth" } }
-  },
-  "layers": [
-    {
-      "y": 0,
-      "rows": ["AA", "BB"]
-    },
-    {
-      "y": 1,
-      "rows": ["BB", "AA"]
-    }
-  ]
-}
-]]
-
-local SAMPLE_VOXEL = [[
-{
-  "grid": {
-    "0": {
-      "0": { "0": "minecraft:oak_log", "1": "minecraft:oak_log" },
-      "1": { "0": "minecraft:oak_leaves", "1": "minecraft:oak_leaves" }
-    },
-    "1": {
-      "0": { "0": "minecraft:oak_leaves", "1": "minecraft:oak_leaves" },
-      "1": { "0": "minecraft:air", "1": "minecraft:torch" }
-    }
-  }
-}
-]]
-
-local EXPECT_TEXT_GRID = {
-    totalBlocks = 18,
-    materials = {
-        ["minecraft:cobblestone"] = 14,
-        ["minecraft:glass"] = 4,
-    },
-    bounds = {
-        min = { x = 0, y = 0, z = 0 },
-        max = { x = 3, y = 1, z = 3 },
-    },
-}
-
-local EXPECT_JSON = {
-    totalBlocks = 8,
-    materials = {
-        ["minecraft:oak_planks"] = 4,
-        ["minecraft:stone"] = 4,
-    },
-    bounds = {
-        min = { x = 0, y = 0, z = 0 },
-        max = { x = 1, y = 1, z = 1 },
-    },
-}
-
-local EXPECT_VOXEL = {
-    totalBlocks = 8,
-    materials = {
-        ["minecraft:oak_log"] = 2,
-        ["minecraft:oak_leaves"] = 4,
-        ["minecraft:air"] = 1,
-        ["minecraft:torch"] = 1,
-    },
-    bounds = {
-        min = { x = 0, y = 0, z = 0 },
-        max = { x = 1, y = 1, z = 1 },
-    },
-}
-
-local SAMPLE_BLOCK_DATA = {
-    blocks = {
-        { x = 0, y = 0, z = 0, material = "minecraft:cobblestone" },
-        { x = 1, y = 0, z = 0, material = "minecraft:stone" },
-        { x = 0, y = 1, z = 0, material = "minecraft:stone" },
-    },
-}
-
-local SAMPLE_VOXEL_DATA = {
-    grid = {
-        [0] = {
-            [0] = { [0] = "minecraft:oak_log", [1] = "minecraft:oak_log" },
-            [1] = { [0] = "minecraft:oak_leaves", [1] = "minecraft:oak_leaves" },
-        },
-        [1] = {
-            [0] = { [0] = "minecraft:oak_leaves", [1] = "minecraft:oak_leaves" },
-            [1] = { [0] = "minecraft:air", [1] = "minecraft:torch" },
-        },
-    },
-}
-
-local EXPECT_BLOCK_DATA = {
-    totalBlocks = 3,
-    materials = {
-        ["minecraft:cobblestone"] = 1,
-        ["minecraft:stone"] = 2,
-    },
-    bounds = {
-        min = { x = 0, y = 0, z = 0 },
-        max = { x = 1, y = 1, z = 0 },
-    },
-}
-
-local FILE_SAMPLES = {
-    {
-        label = "File Text Grid",
-        path = "tmp_sample_grid.txt",
-        contents = SAMPLE_TEXT_GRID,
-        expect = EXPECT_TEXT_GRID,
-    },
-    {
-        label = "File JSON",
-        path = "tmp_sample_schema.json",
-        contents = SAMPLE_JSON,
-        expect = EXPECT_JSON,
-    },
-    {
-        label = "File Voxel",
-        path = "tmp_sample_voxel.vox",
-        contents = SAMPLE_VOXEL,
-        expect = EXPECT_VOXEL,
-        opts = { formatHint = "voxel" },
-    },
-}
-
 local function executeParse(io, parseCall, expect)
     local callOk, resultOk, schemaOrErr, info = pcall(parseCall)
     if not callOk then
@@ -345,11 +113,11 @@ end
 
 local function runFileSample(io, ctx, sample)
     return executeParse(io, function()
-        local ok, err = writeFile(sample.path, sample.contents)
+        local ok, err = fs_utils.writeFile(sample.path, sample.contents)
         if not ok then
             return false, err or "write_failed"
         end
-        stageArtifact(sample.path)
+        fs_utils.stageArtifact(sample.path)
         return parser.parseFile(ctx, sample.path, sample.opts)
     end, sample.expect)
 end
@@ -414,62 +182,62 @@ local function run(ctxOverrides, ioOverrides)
 
     step("Sample Text Grid", function()
         return executeParse(io, function()
-            return parser.parse(ctx, { text = SAMPLE_TEXT_GRID, format = "grid" })
-        end, EXPECT_TEXT_GRID)
+            return parser.parse(ctx, { text = data.SAMPLE_TEXT_GRID, format = "grid" })
+        end, data.EXPECT_TEXT_GRID)
     end)
 
     step("Sample JSON", function()
         return executeParse(io, function()
-            return parser.parse(ctx, { text = SAMPLE_JSON, format = "json" })
-        end, EXPECT_JSON)
+            return parser.parse(ctx, { text = data.SAMPLE_JSON, format = "json" })
+        end, data.EXPECT_JSON)
     end)
 
     step("Sample Voxel", function()
         return executeParse(io, function()
-            return parser.parse(ctx, { text = SAMPLE_VOXEL, format = "voxel" })
-        end, EXPECT_VOXEL)
+            return parser.parse(ctx, { text = data.SAMPLE_VOXEL, format = "voxel" })
+        end, data.EXPECT_VOXEL)
     end)
 
     step("Sample Text Grid via parseText", function()
         return executeParse(io, function()
-            return parser.parseText(ctx, SAMPLE_TEXT_GRID)
-        end, EXPECT_TEXT_GRID)
+            return parser.parseText(ctx, data.SAMPLE_TEXT_GRID)
+        end, data.EXPECT_TEXT_GRID)
     end)
 
     step("Sample JSON Blocks via parseJson", function()
         return executeParse(io, function()
-            return parser.parseJson(ctx, SAMPLE_BLOCK_DATA)
-        end, EXPECT_BLOCK_DATA)
+            return parser.parseJson(ctx, data.SAMPLE_BLOCK_DATA)
+        end, data.EXPECT_BLOCK_DATA)
     end)
 
     step("Sample Voxel via data", function()
         return executeParse(io, function()
-            return parser.parse(ctx, { data = SAMPLE_VOXEL_DATA, format = "voxel" })
-        end, EXPECT_VOXEL)
+            return parser.parse(ctx, { data = data.SAMPLE_VOXEL_DATA, format = "voxel" })
+        end, data.EXPECT_VOXEL)
     end)
 
     step("Sample JSON direct source", function()
         return executeParse(io, function()
-            return parser.parse(ctx, SAMPLE_JSON)
-        end, EXPECT_JSON)
+            return parser.parse(ctx, data.SAMPLE_JSON)
+        end, data.EXPECT_JSON)
     end)
 
-    for _, sample in ipairs(FILE_SAMPLES) do
+    for _, sample in ipairs(data.FILE_SAMPLES) do
         step(sample.label, function()
             return runFileSample(io, ctx, sample)
         end)
     end
 
     step("File autodetect via parse", function()
-        local sample = FILE_SAMPLES[1]
+        local sample = data.FILE_SAMPLES[1]
         return executeParse(io, function()
-            local ok, err = writeFile(sample.path, sample.contents)
+            local ok, err = fs_utils.writeFile(sample.path, sample.contents)
             if not ok then
                 return false, err or "write_failed"
             end
-            stageArtifact(sample.path)
+            fs_utils.stageArtifact(sample.path)
             return parser.parse(ctx, { source = sample.path })
-        end, EXPECT_TEXT_GRID)
+        end, data.EXPECT_TEXT_GRID)
     end)
 
     local customFileAnswer = common.promptInput(io, "Run custom file test? (y/n)", "n")
@@ -503,7 +271,7 @@ local function run(ctxOverrides, ioOverrides)
         end
     end
 
-    cleanupArtifacts()
+    fs_utils.cleanupArtifacts()
     return suite
 end
 

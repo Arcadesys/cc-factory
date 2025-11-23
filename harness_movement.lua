@@ -3,6 +3,7 @@
 
 local movement = require("lib_movement")
 local common = require("harness_common")
+local reporter = require("lib_reporter")
 
 local DEFAULT_CONTEXT = {
     origin = { x = 0, y = 0, z = 0 },
@@ -19,35 +20,12 @@ local DEFAULT_CONTEXT = {
     },
 }
 
-local function describePosition(ctx)
-    local pos = movement.getPosition(ctx)
-    local facing = movement.getFacing(ctx)
-    return string.format("(x=%d, y=%d, z=%d, facing=%s)", pos.x, pos.y, pos.z, tostring(facing))
-end
-
 local function prompt(io, message)
     return common.promptEnter(io, message)
 end
 
-local function run(ctxOverrides, ioOverrides)
-    local io = common.resolveIo(ioOverrides)
-    local ctx = common.merge(DEFAULT_CONTEXT, ctxOverrides or {})
-    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
-
-    movement.ensureState(ctx)
-
-    local suite = common.createSuite({ name = "Movement Harness", io = io })
-    local function step(name, fn)
-        return suite:step(name, fn)
-    end
-
-    if io.print then
-        io.print("Movement harness starting.\n")
-        io.print("Before running, ensure the turtle is in an open area with at least a 3x3 clearing and fuel available.")
-        io.print("The harness assumes the turtle starts at origin (0,0,0) facing north relative to your coordinate system.")
-    end
-
-    step("Orientation exercises", function()
+local function stepOrientationExercises(ctx, io)
+    return function()
         local ok, err = movement.faceDirection(ctx, "north")
         if not ok then
             return false, err
@@ -73,12 +51,14 @@ local function run(ctxOverrides, ioOverrides)
             return false, err
         end
         if io.print then
-            io.print("Orientation complete: " .. describePosition(ctx))
+            io.print("Orientation complete: " .. reporter.describePosition(ctx))
         end
         return true
-    end)
+    end
+end
 
-    step("Forward with obstacle clearing", function()
+local function stepForwardWithObstacleClearing(ctx, io)
+    return function()
         if not turtle then
             return false, "turtle API unavailable"
         end
@@ -91,19 +71,21 @@ local function run(ctxOverrides, ioOverrides)
             return false, err
         end
         if io.print then
-            io.print("Moved forward to: " .. describePosition(ctx))
+            io.print("Moved forward to: " .. reporter.describePosition(ctx))
         end
         ok, err = movement.returnToOrigin(ctx, {})
         if not ok then
             return false, err
         end
         if io.print then
-            io.print("Returned to origin: " .. describePosition(ctx))
+            io.print("Returned to origin: " .. reporter.describePosition(ctx))
         end
         return true
-    end)
+    end
+end
 
-    step("Vertical movement", function()
+local function stepVerticalMovement(ctx, io)
+    return function()
         local ok, err = movement.up(ctx, {})
         if not ok then
             return false, err
@@ -113,12 +95,14 @@ local function run(ctxOverrides, ioOverrides)
             return false, err
         end
         if io.print then
-            io.print("Vertical traversal successful: " .. describePosition(ctx))
+            io.print("Vertical traversal successful: " .. reporter.describePosition(ctx))
         end
         return true
-    end)
+    end
+end
 
-    step("goTo square loop", function()
+local function stepGoToSquareLoop(ctx, io)
+    return function()
         local path = {
             { x = 1, y = 0, z = 0 },
             { x = 1, y = 0, z = 1 },
@@ -130,19 +114,21 @@ local function run(ctxOverrides, ioOverrides)
             return false, err
         end
         if io.print then
-            io.print("Path completed, position: " .. describePosition(ctx))
+            io.print("Path completed, position: " .. reporter.describePosition(ctx))
         end
         ok, err = movement.returnToOrigin(ctx, {})
         if not ok then
             return false, err
         end
         if io.print then
-            io.print("Returned to origin: " .. describePosition(ctx))
+            io.print("Returned to origin: " .. reporter.describePosition(ctx))
         end
         return true
-    end)
+    end
+end
 
-    step("Return to origin alignment", function()
+local function stepReturnToOriginAlignment(ctx, io)
+    return function()
         local ok, err = movement.faceDirection(ctx, "east")
         if not ok then
             return false, err
@@ -152,10 +138,32 @@ local function run(ctxOverrides, ioOverrides)
             return false, err
         end
         if io.print then
-            io.print("Final pose: " .. describePosition(ctx))
+            io.print("Final pose: " .. reporter.describePosition(ctx))
         end
         return true
-    end)
+    end
+end
+
+local function run(ctxOverrides, ioOverrides)
+    local io = common.resolveIo(ioOverrides)
+    local ctx = common.merge(DEFAULT_CONTEXT, ctxOverrides or {})
+    ctx.logger = ctx.logger or common.makeLogger(ctx, io)
+
+    movement.ensureState(ctx)
+
+    local suite = common.createSuite({ name = "Movement Harness", io = io })
+
+    if io.print then
+        io.print("Movement harness starting.\n")
+        io.print("Before running, ensure the turtle is in an open area with at least a 3x3 clearing and fuel available.")
+        io.print("The harness assumes the turtle starts at origin (0,0,0) facing north relative to your coordinate system.")
+    end
+
+    suite:step("Orientation exercises", stepOrientationExercises(ctx, io))
+    suite:step("Forward with obstacle clearing", stepForwardWithObstacleClearing(ctx, io))
+    suite:step("Vertical movement", stepVerticalMovement(ctx, io))
+    suite:step("goTo square loop", stepGoToSquareLoop(ctx, io))
+    suite:step("Return to origin alignment", stepReturnToOriginAlignment(ctx, io))
 
     suite:summary()
     return suite

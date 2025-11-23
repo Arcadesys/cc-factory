@@ -3,17 +3,21 @@
 -- harnesses can double as automated tests while keeping console output short.
 
 local common = {}
+local table_utils = require("lib_table")
+local string_utils = require("lib_string")
+
+common.merge = table_utils.merge
 
 local function resolveIo(io)
-    if type(io) ~= "table" then
-        io = {}
-    end
+    io = type(io) == "table" and io or {}
 
     local resolved = {
         print = io.print or print,
         read = io.read or _G.read,
         sleep = io.sleep or _G.sleep,
         write = io.write or _G.write or write,
+        term = io.term or term,
+        colors = io.colors or colors,
     }
 
     if type(resolved.write) ~= "function" then
@@ -24,9 +28,6 @@ local function resolveIo(io)
             end
         end
     end
-
-    resolved.term = io.term or term
-    resolved.colors = io.colors or colors
 
     return resolved
 end
@@ -64,52 +65,6 @@ function common.makeLogger(ctx, io)
     return logger
 end
 
-local function deepCopy(value)
-    if type(value) ~= "table" then
-        return value
-    end
-    local result = {}
-    for k, v in pairs(value) do
-        result[k] = deepCopy(v)
-    end
-    return result
-end
-
-function common.merge(base, overrides)
-    if type(base) ~= "table" and type(overrides) ~= "table" then
-        return overrides or base
-    end
-
-    local result = {}
-
-    if type(base) == "table" then
-        for k, v in pairs(base) do
-            result[k] = deepCopy(v)
-        end
-    end
-
-    if type(overrides) == "table" then
-        for k, v in pairs(overrides) do
-            if type(v) == "table" and type(result[k]) == "table" then
-                result[k] = common.merge(result[k], v)
-            else
-                result[k] = deepCopy(v)
-            end
-        end
-    elseif overrides ~= nil then
-        return deepCopy(overrides)
-    end
-
-    return result
-end
-
-local function trim(text)
-    if type(text) ~= "string" then
-        return text
-    end
-    return text:match("^%s*(.-)%s*$")
-end
-
 function common.prompt(io, message, opts)
     io = resolveIo(io)
     opts = opts or {}
@@ -120,7 +75,7 @@ function common.prompt(io, message, opts)
     if io.read then
         local line = io.read()
         if not opts.allowEmpty then
-            line = trim(line)
+            line = string_utils.trim(line)
             if line and line ~= "" then
                 return line
             end
@@ -218,38 +173,47 @@ function common.createSuite(opts)
         local count = #self.results
         local passed = 0
         self.io.print("\n== Summary: " .. self.name .. " ==")
+
         local hasColor = supportsColor(self.io)
         local defaultColor
         if hasColor and type(self.io.term.getTextColor) == "function" then
             defaultColor = self.io.term.getTextColor()
         end
-        for index, result in ipairs(self.results) do
+
+        local function write(text)
+            if self.io.write then
+                self.io.write(text)
+            else
+                self.io.print(text)
+            end
+        end
+
+        local function writeResult(result, index)
             local label = result.ok and "PASS" or "FAIL"
             local color = nil
             if hasColor and self.io.colors then
                 color = result.ok and self.io.colors.green or self.io.colors.red
             end
-            if self.io.write then
-                self.io.write(string.format("%2d) ", index))
-            else
-                self.io.print(string.format("%2d) ", index))
-            end
+
+            write(string.format("%2d) ", index))
+
             if hasColor and color then
                 self.io.term.setTextColor(color)
             end
-            if self.io.write then
-                self.io.write("[" .. label .. "]")
-            else
-                self.io.print("[" .. label .. "]")
-            end
+            write("[" .. label .. "]")
             if hasColor and defaultColor then
                 self.io.term.setTextColor(defaultColor)
             end
+
             if self.io.write then
-                self.io.write(" " .. result.name .. "\n")
+                write(" " .. result.name .. "\n")
             else
-                self.io.print(" " .. result.name)
+                write(" " .. result.name)
             end
+        end
+
+        for index, result in ipairs(self.results) do
+            writeResult(result, index)
             if result.ok then
                 passed = passed + 1
             end

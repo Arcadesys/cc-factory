@@ -8,198 +8,11 @@ return success booleans with optional error messages and metadata tables.
 ---@diagnostic disable: undefined-global
 
 local parser = {}
-
-local function log(ctx, level, message)
-    if type(ctx) ~= "table" then
-        return
-    end
-    local logger = ctx.logger
-    if type(logger) ~= "table" then
-        return
-    end
-    local fn = logger[level]
-    if type(fn) == "function" then
-        fn(message)
-        return
-    end
-    if type(logger.log) == "function" then
-        logger.log(level, message)
-    end
-end
-
-local function shallowCopy(tbl)
-    local result = {}
-    for k, v in pairs(tbl) do
-        result[k] = v
-    end
-    return result
-end
-
-local function readFile(path)
-    if type(path) ~= "string" or path == "" then
-        return nil, "invalid_path"
-    end
-    if fs and fs.open then
-        local handle = fs.open(path, "r")
-        if not handle then
-            return nil, "open_failed"
-        end
-        local ok, contents = pcall(handle.readAll)
-        handle.close()
-        if not ok then
-            return nil, "read_failed"
-        end
-        return contents
-    end
-    if io and io.open then
-        local handle, err = io.open(path, "r")
-        if not handle then
-            return nil, err or "open_failed"
-        end
-        local contents = handle:read("*a")
-        handle:close()
-        return contents
-    end
-    return nil, "fs_unavailable"
-end
-
-local function decodeJson(text)
-    if type(text) ~= "string" then
-        return nil, "invalid_json"
-    end
-    if textutils and textutils.unserializeJSON then
-        local ok, result = pcall(textutils.unserializeJSON, text)
-        if ok and result ~= nil then
-            return result
-        end
-        return nil, "json_parse_failed"
-    end
-    local ok, json = pcall(require, "json")
-    if ok and type(json) == "table" and type(json.decode) == "function" then
-        local okDecode, result = pcall(json.decode, text)
-        if okDecode then
-            return result
-        end
-        return nil, "json_parse_failed"
-    end
-    return nil, "json_decoder_unavailable"
-end
-
-local function pushMaterialCount(counts, material)
-    counts[material] = (counts[material] or 0) + 1
-end
-
-local function cloneMeta(meta)
-    if type(meta) ~= "table" then
-        return {}
-    end
-    return shallowCopy(meta)
-end
-
-local function newBounds()
-    return {
-        min = { x = math.huge, y = math.huge, z = math.huge },
-        max = { x = -math.huge, y = -math.huge, z = -math.huge },
-    }
-end
-
-local function updateBounds(bounds, x, y, z)
-    local minB = bounds.min
-    local maxB = bounds.max
-    if x < minB.x then minB.x = x end
-    if y < minB.y then minB.y = y end
-    if z < minB.z then minB.z = z end
-    if x > maxB.x then maxB.x = x end
-    if y > maxB.y then maxB.y = y end
-    if z > maxB.z then maxB.z = z end
-end
-
-local function addBlock(schema, bounds, counts, x, y, z, material, meta)
-    if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
-        return false, "invalid_coordinate"
-    end
-    if type(material) ~= "string" or material == "" then
-        return false, "invalid_material"
-    end
-    meta = cloneMeta(meta)
-    schema[x] = schema[x] or {}
-    local yLayer = schema[x]
-    yLayer[y] = yLayer[y] or {}
-    local zLayer = yLayer[y]
-    if zLayer[z] ~= nil then
-        return false, "duplicate_coordinate"
-    end
-    zLayer[z] = { material = material, meta = meta }
-    updateBounds(bounds, x, y, z)
-    pushMaterialCount(counts, material)
-    return true
-end
-
-local function mergeLegend(base, override)
-    local result = {}
-    if type(base) == "table" then
-        for symbol, entry in pairs(base) do
-            result[symbol] = entry
-        end
-    end
-    if type(override) == "table" then
-        for symbol, entry in pairs(override) do
-            result[symbol] = entry
-        end
-    end
-    return result
-end
-
-local function normaliseLegendEntry(symbol, entry)
-    if entry == nil then
-        return nil, "unknown_symbol"
-    end
-    if entry == false or entry == "" then
-        return false
-    end
-    if type(entry) == "string" then
-        return { material = entry, meta = {} }
-    end
-    if type(entry) == "table" then
-        if entry.material == nil and entry[1] then
-            entry = { material = entry[1], meta = entry[2] }
-        end
-        local material = entry.material
-        if material == nil or material == "" then
-            return false
-        end
-        local meta = entry.meta
-        if meta ~= nil and type(meta) ~= "table" then
-            return nil, "invalid_meta"
-        end
-        return { material = material, meta = meta or {} }
-    end
-    return nil, "invalid_legend_entry"
-end
-
-local function resolveSymbol(symbol, legend, opts)
-    if symbol == "" then
-        return nil, "empty_symbol"
-    end
-    if legend == nil then
-        return nil, "missing_legend"
-    end
-    local entry = legend[symbol]
-    if entry == nil then
-        if symbol == "." or symbol == " " then
-            return false
-        end
-        if opts and opts.allowImplicitAir and symbol:match("^%p?$") then
-            return false
-        end
-        return nil, "unknown_symbol"
-    end
-    local normalised, err = normaliseLegendEntry(symbol, entry)
-    if err then
-        return nil, err
-    end
-    return normalised
-end
+local logger = require("lib_logger")
+local table_utils = require("lib_table")
+local fs_utils = require("lib_fs")
+local json_utils = require("lib_json")
+local schema_utils = require("lib_schema")
 
 local function parseLayerRows(schema, bounds, counts, layerDef, legend, opts)
     local rows = layerDef.rows
@@ -225,7 +38,7 @@ local function parseLayerRows(schema, bounds, counts, layerDef, legend, opts)
         end
         for col = 1, #row do
             local symbol = row:sub(col, col)
-            local entry, err = resolveSymbol(symbol, legend, opts)
+            local entry, err = schema_utils.resolveSymbol(symbol, legend, opts)
             if err then
                 return false, string.format("legend_error:%s", symbol)
             end
@@ -233,7 +46,7 @@ local function parseLayerRows(schema, bounds, counts, layerDef, legend, opts)
                 local x = (layerDef.x or 0) + (col - 1)
                 local y = layerDef.y or 0
                 local z = (layerDef.z or 0) + (rowIndex - 1)
-                local ok, addErr = addBlock(schema, bounds, counts, x, y, z, entry.material, entry.meta)
+                local ok, addErr = schema_utils.addBlock(schema, bounds, counts, x, y, z, entry.material, entry.meta)
                 if not ok then
                     return false, addErr
                 end
@@ -325,7 +138,7 @@ local function parseBlockList(schema, bounds, counts, blocks)
         if type(meta) ~= "table" then
             meta = {}
         end
-        local ok, err = addBlock(schema, bounds, counts, x, y, z, material, meta)
+        local ok, err = schema_utils.addBlock(schema, bounds, counts, x, y, z, material, meta)
         if not ok then
             return false, err
         end
@@ -375,7 +188,7 @@ local function parseVoxelGrid(schema, bounds, counts, grid)
                         return false, "invalid_block"
                     end
                     if material and material ~= "" then
-                        local ok, err = addBlock(schema, bounds, counts, x, y, z, material, meta)
+                        local ok, err = schema_utils.addBlock(schema, bounds, counts, x, y, z, material, meta)
                         if not ok then
                             return false, err
                         end
@@ -408,8 +221,8 @@ local function summarise(bounds, counts)
     end
     return {
         bounds = {
-            min = shallowCopy(bounds.min),
-            max = shallowCopy(bounds.max),
+            min = table_utils.shallowCopy(bounds.min),
+            max = table_utils.shallowCopy(bounds.max),
         },
         materials = materials,
         totalBlocks = total,
@@ -418,7 +231,7 @@ end
 
 local function buildCanonical(def, opts)
     local schema = {}
-    local bounds = newBounds()
+    local bounds = schema_utils.newBounds()
     local counts = {}
     local ok, err
     if def.blocks then
@@ -491,7 +304,7 @@ local function parseLegendBlock(lines, index)
             rest = rest:gsub("^%s+", ""):gsub("%s+$", "")
             local value
             if rest:sub(1, 1) == "{" then
-                local parsed = decodeJson(rest)
+                local parsed = json_utils.decodeJson(rest)
                 if parsed then
                     value = parsed
                 else
@@ -513,7 +326,7 @@ local function parseTextGridContent(text, opts)
         line = line:gsub("\r$", "")
         lines[#lines + 1] = line
     end
-    local legend = mergeLegend(opts and opts.legend or nil, nil)
+    local legend = schema_utils.mergeLegend(opts and opts.legend or nil, nil)
     local layers = {}
     local current = {}
     local currentY = nil
@@ -530,7 +343,7 @@ local function parseTextGridContent(text, opts)
             lineIndex = lineIndex + 1
         elseif trimmed:lower() == "legend:" then
             local legendBlock, nextIndex = parseLegendBlock(lines, lineIndex + 1)
-            legend = mergeLegend(legend, legendBlock)
+            legend = schema_utils.mergeLegend(legend, legendBlock)
             lineIndex = nextIndex
         elseif trimmed:match("^layer") then
             if #current > 0 then
@@ -564,7 +377,7 @@ local function parseJsonContent(obj, opts)
     if type(obj) ~= "table" then
         return nil, "invalid_json_root"
     end
-    local legend = mergeLegend(opts and opts.legend or nil, obj.legend or nil)
+    local legend = schema_utils.mergeLegend(opts and opts.legend or nil, obj.legend or nil)
     if obj.blocks then
         return {
             blocks = obj.blocks,
@@ -605,7 +418,7 @@ end
 
 local function ensureSpecTable(spec)
     if type(spec) == "table" then
-        return shallowCopy(spec)
+        return table_utils.shallowCopy(spec)
     end
     if type(spec) == "string" then
         return { source = spec }
@@ -645,7 +458,7 @@ function parser.parse(ctx, spec)
         end
     end
     if text == nil and path then
-        local contents, err = readFile(path)
+        local contents, err = fs_utils.readFile(path)
         if not contents then
             return false, err or "read_failed"
         end
@@ -675,7 +488,7 @@ function parser.parse(ctx, spec)
         if data then
             definition, err = parseJsonContent(data, spec)
         else
-            local obj, decodeErr = decodeJson(text)
+            local obj, decodeErr = json_utils.decodeJson(text)
             if not obj then
                 return false, decodeErr
             end
@@ -685,7 +498,7 @@ function parser.parse(ctx, spec)
         if data and (data.layers or data.rows) then
             definition = {
                 layers = data.layers or { data.rows },
-                legend = mergeLegend(spec.legend or nil, data.legend or nil),
+                legend = schema_utils.mergeLegend(spec.legend or nil, data.legend or nil),
             }
         else
             definition, err = parseTextGridContent(text, spec)
@@ -696,7 +509,7 @@ function parser.parse(ctx, spec)
                 grid = data.grid or data.voxels or data,
             }
         else
-            local obj, decodeErr = decodeJson(text)
+            local obj, decodeErr = json_utils.decodeJson(text)
             if not obj then
                 return false, decodeErr
             end
@@ -715,7 +528,7 @@ function parser.parse(ctx, spec)
         return false, err or "invalid_definition"
     end
     if spec.legend then
-        definition.legend = mergeLegend(definition.legend, spec.legend)
+        definition.legend = schema_utils.mergeLegend(definition.legend, spec.legend)
     end
     local schema, metadata = buildCanonical(definition, spec)
     if not schema then
@@ -728,7 +541,7 @@ function parser.parse(ctx, spec)
     metadata.format = format
     metadata.path = path
     assignToContext(ctx, schema, metadata)
-    log(ctx, "debug", string.format("Parsed schema with %d blocks", metadata.totalBlocks or 0))
+    logger.log(ctx, "debug", string.format("Parsed schema with %d blocks", metadata.totalBlocks or 0))
     return true, schema, metadata
 end
 

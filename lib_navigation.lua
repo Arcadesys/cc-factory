@@ -10,53 +10,11 @@ local okMovement, movement = pcall(require, "lib_movement")
 if not okMovement then
     movement = nil
 end
+local logger = require("lib_logger")
+local table_utils = require("lib_table")
+local world = require("lib_world")
 
 local navigation = {}
-
-local function log(ctx, level, message)
-    if type(ctx) ~= "table" then
-        return
-    end
-    local logger = ctx.logger
-    if type(logger) ~= "table" then
-        return
-    end
-    local fn = logger[level]
-    if type(fn) == "function" then
-        fn(message)
-        return
-    end
-    if type(logger.log) == "function" then
-        logger.log(level, message)
-    end
-end
-
-local function copyValue(value, seen)
-    if type(value) ~= "table" then
-        return value
-    end
-    seen = seen or {}
-    if seen[value] then
-        return seen[value]
-    end
-    local result = {}
-    seen[value] = result
-    for k, v in pairs(value) do
-        result[k] = copyValue(v, seen)
-    end
-    return result
-end
-
-local function normaliseCoordinate(value)
-    local number = tonumber(value)
-    if number == nil then
-        return nil
-    end
-    if number >= 0 then
-        return math.floor(number + 0.5)
-    end
-    return math.ceil(number - 0.5)
-end
 
 local function isCoordinateSpec(tbl)
     if type(tbl) ~= "table" then
@@ -71,31 +29,6 @@ local function isCoordinateSpec(tbl)
     return hasX and hasY and hasZ
 end
 
-local function normalisePosition(pos)
-    if type(pos) ~= "table" then
-        return nil, "invalid_position"
-    end
-    local xRaw = pos.x
-    if xRaw == nil then
-        xRaw = pos[1]
-    end
-    local yRaw = pos.y
-    if yRaw == nil then
-        yRaw = pos[2]
-    end
-    local zRaw = pos.z
-    if zRaw == nil then
-        zRaw = pos[3]
-    end
-    local x = normaliseCoordinate(xRaw)
-    local y = normaliseCoordinate(yRaw)
-    local z = normaliseCoordinate(zRaw)
-    if not x or not y or not z then
-        return nil, "invalid_position"
-    end
-    return { x = x, y = y, z = z }
-end
-
 local function cloneNodeDefinition(def)
     if type(def) ~= "table" then
         return nil, "invalid_route_definition"
@@ -103,7 +36,7 @@ local function cloneNodeDefinition(def)
     local result = {}
     for index, value in ipairs(def) do
         if type(value) == "table" then
-            result[index] = copyValue(value)
+            result[index] = table_utils.copyValue(value)
         else
             result[index] = value
         end
@@ -128,11 +61,11 @@ local function ensureNavigationState(ctx)
     state._configLoaded = state._configLoaded or false
 
     if ctx.origin then
-        local originPos, originErr = normalisePosition(ctx.origin)
+        local originPos, originErr = world.normalisePosition(ctx.origin)
         if originPos then
             state.waypoints.origin = originPos
         elseif originErr then
-            log(ctx, "warn", "Origin position invalid: " .. tostring(originErr))
+            logger.log(ctx, "warn", "Origin position invalid: " .. tostring(originErr))
         end
     end
 
@@ -143,11 +76,11 @@ local function ensureNavigationState(ctx)
             local navCfg = cfg.navigation
             if type(navCfg.waypoints) == "table" then
                 for name, pos in pairs(navCfg.waypoints) do
-                    local normalised, err = normalisePosition(pos)
+                    local normalised, err = world.normalisePosition(pos)
                     if normalised then
                         state.waypoints[name] = normalised
                     else
-                        log(ctx, "warn", string.format("Ignoring navigation waypoint '%s': %s", tostring(name), tostring(err)))
+                        logger.log(ctx, "warn", string.format("Ignoring navigation waypoint '%s': %s", tostring(name), tostring(err)))
                     end
                 end
             end
@@ -157,12 +90,12 @@ local function ensureNavigationState(ctx)
                     if cloned then
                         state.routes[name] = cloned
                     else
-                        log(ctx, "warn", string.format("Ignoring navigation route '%s': %s", tostring(name), tostring(err)))
+                        logger.log(ctx, "warn", string.format("Ignoring navigation route '%s': %s", tostring(name), tostring(err)))
                     end
                 end
             end
             if type(navCfg.restock) == "table" then
-                state.restock = copyValue(navCfg.restock)
+                state.restock = table_utils.copyValue(navCfg.restock)
             end
         end
     end
@@ -254,7 +187,7 @@ function expandSpec(ctx, spec, visited)
     end
 
     if isCoordinateSpec(spec) then
-        local pos, err = normalisePosition(spec)
+        local pos, err = world.normalisePosition(spec)
         if not pos then
             return nil, err
         end
@@ -357,7 +290,7 @@ function expandSpec(ctx, spec, visited)
     end
 
     if spec.position then
-        local pos, err = normalisePosition(spec.position)
+        local pos, err = world.normalisePosition(spec.position)
         if not pos then
             return nil, err
         end
@@ -402,7 +335,7 @@ function navigation.registerWaypoint(ctx, name, position)
         return false, "invalid_waypoint_name"
     end
     local state = ensureNavigationState(ctx)
-    local pos, err = normalisePosition(position)
+    local pos, err = world.normalisePosition(position)
     if not pos then
         return false, err or "invalid_position"
     end
@@ -481,7 +414,7 @@ local function resolveRestockSpec(ctx, kind)
     if spec == nil then
         return nil
     end
-    return copyValue(spec)
+    return table_utils.copyValue(spec)
 end
 
 function navigation.getRestockTarget(ctx, kind)
@@ -505,7 +438,7 @@ function navigation.setRestockTarget(ctx, kind, spec)
     if specType ~= "string" and specType ~= "table" and specType ~= "function" then
         return false, "invalid_restock_spec"
     end
-    state.restock[kind] = copyValue(spec)
+    state.restock[kind] = table_utils.copyValue(spec)
     return true
 end
 

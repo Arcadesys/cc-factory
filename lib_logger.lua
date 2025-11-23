@@ -433,4 +433,25 @@ logger.LEVELS = copyTable(LEVEL_VALUE, 1)
 logger.LABELS = copyTable(LEVEL_LABEL, 1)
 logger.resolveLevel = resolveLevel
 
+function logger.log(ctx, level, message)
+    if type(ctx) ~= "table" then
+        return
+    end
+    local logger = ctx.logger
+    if type(logger) == "table" then
+        local fn = logger[level]
+        if type(fn) == "function" then
+            fn(message)
+            return
+        end
+        if type(logger.log) == "function" then
+            logger.log(level, message)
+            return
+        end
+    end
+    if (level == "warn" or level == "error") and message then
+        print(string.format("[%s] %s", level:upper(), message))
+    end
+end
+
 return logger
