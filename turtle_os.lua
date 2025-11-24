@@ -4,6 +4,8 @@ Graphical launcher for the factory agent.
 --]]
 
 local ui = require("lib_ui")
+local designer = require("lib_designer")
+local games = require("lib_games")
 
 -- Hack to load factory without running it immediately
 _G.__FACTORY_EMBED__ = true
@@ -42,14 +44,63 @@ local function runMining(form)
 end
 
 local function runTunnel()
+    local length = 16
+    local width = 1
+    local height = 2
+    local torch = 6
+    
+    local form = ui.Form("Tunnel Configuration")
+    form:addInput("length", "Length", tostring(length))
+    form:addInput("width", "Width", tostring(width))
+    form:addInput("height", "Height", tostring(height))
+    form:addInput("torch", "Torch Interval", tostring(torch))
+    
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+    
+    for _, el in ipairs(form.elements) do
+        if el.id == "length" then length = tonumber(el.value) or 16 end
+        if el.id == "width" then width = tonumber(el.value) or 1 end
+        if el.id == "height" then height = tonumber(el.value) or 2 end
+        if el.id == "torch" then torch = tonumber(el.value) or 6 end
+    end
+    
     ui.clear()
-    print("Tunneling not implemented yet.")
+    print("Starting Tunnel Operation...")
+    print(string.format("L: %d, W: %d, H: %d", length, width, height))
+    sleep(1)
+    
+    factory.run({ "tunnel", "--length", tostring(length), "--width", tostring(width), "--height", tostring(height), "--torch-interval", tostring(torch) })
+    
     return pauseAndReturn("stay")
 end
 
 local function runExcavate()
+    local length = 8
+    local width = 8
+    local depth = 3
+    
+    local form = ui.Form("Excavation Configuration")
+    form:addInput("length", "Length", tostring(length))
+    form:addInput("width", "Width", tostring(width))
+    form:addInput("depth", "Depth", tostring(depth))
+    
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+    
+    for _, el in ipairs(form.elements) do
+        if el.id == "length" then length = tonumber(el.value) or 8 end
+        if el.id == "width" then width = tonumber(el.value) or 8 end
+        if el.id == "depth" then depth = tonumber(el.value) or 3 end
+    end
+    
     ui.clear()
-    print("Excavation not implemented yet.")
+    print("Starting Excavation Operation...")
+    print(string.format("L: %d, W: %d, D: %d", length, width, depth))
+    sleep(1)
+    
+    factory.run({ "excavate", "--length", tostring(length), "--width", tostring(width), "--depth", tostring(depth) })
+    
     return pauseAndReturn("stay")
 end
 
@@ -62,8 +113,28 @@ local function runTreeFarm()
 end
 
 local function runPotatoFarm()
+    local width = 9
+    local length = 9
+    
+    local form = ui.Form("Potato Farm Configuration")
+    form:addInput("width", "Width", tostring(width))
+    form:addInput("length", "Length", tostring(length))
+    
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+    
+    for _, el in ipairs(form.elements) do
+        if el.id == "width" then width = tonumber(el.value) or 9 end
+        if el.id == "length" then length = tonumber(el.value) or 9 end
+    end
+    
     ui.clear()
-    print("Potato Farm not implemented yet.")
+    print("Starting Potato Farm Build...")
+    print(string.format("W: %d, L: %d", width, length))
+    sleep(1)
+    
+    factory.run({ "farm", "--farm-type", "potato", "--width", tostring(width), "--length", tostring(length) })
+    
     return pauseAndReturn("stay")
 end
 
@@ -77,14 +148,60 @@ local function runBuild(schemaFile)
 end
 
 local function runImportSchema()
+    local url = ""
+    local filename = "schema.json"
+    
+    local form = ui.Form("Import Schema")
+    form:addInput("url", "URL/Code", url)
+    form:addInput("filename", "Save As", filename)
+    
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+    
+    for _, el in ipairs(form.elements) do
+        if el.id == "url" then url = el.value end
+        if el.id == "filename" then filename = el.value end
+    end
+    
+    if url == "" then
+        print("URL is required.")
+        return pauseAndReturn("stay")
+    end
+    
     ui.clear()
-    print("Import Schema not implemented yet.")
+    print("Downloading " .. url .. "...")
+    
+    if not url:find("http") then
+        -- Assume pastebin code
+        url = "https://pastebin.com/raw/" .. url
+    end
+    
+    if not http then
+        print("HTTP API not enabled.")
+        return pauseAndReturn("stay")
+    end
+    
+    local response = http.get(url)
+    if not response then
+        print("Failed to download.")
+        return pauseAndReturn("stay")
+    end
+    
+    local content = response.readAll()
+    response.close()
+    
+    local f = fs.open(filename, "w")
+    f.write(content)
+    f.close()
+    
+    print("Saved to " .. filename)
+    
     return pauseAndReturn("stay")
 end
 
 local function runSchemaDesigner()
     ui.clear()
-    print("Schema Designer not implemented yet.")
+    designer.run()
     return pauseAndReturn("stay")
 end
 
@@ -174,12 +291,25 @@ local function showSystemMenu()
     end
 end
 
+local function showGamesMenu()
+    while true do
+        local res = ui.runMenu("Games", {
+            { text = "Solitaire", callback = games.solitaire },
+            { text = "Minesweeper", callback = games.minesweeper },
+            { text = "Euchre", callback = games.euchre },
+            { text = "Back", callback = function() return "back" end }
+        })
+        if res == "back" then return end
+    end
+end
+
 local function showMainMenu()
     while true do
         local res = ui.runMenu("TurtleOS v2.1", {
             { text = "MINE >", callback = showMineMenu },
             { text = "FARM >", callback = showFarmMenu },
             { text = "BUILD >", callback = showBuildMenu },
+            { text = "GAMES >", callback = showGamesMenu },
             { text = "SYSTEM >", callback = showSystemMenu },
             { text = "Exit", callback = function() return "exit" end }
         })

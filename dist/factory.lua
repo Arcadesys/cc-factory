@@ -68,6 +68,12 @@ local function run(args)
             ctx.config.verbose = true
         elseif value == "mine" then
             ctx.config.mode = "mine"
+        elseif value == "tunnel" then
+            ctx.config.mode = "tunnel"
+        elseif value == "excavate" then
+            ctx.config.mode = "excavate"
+        elseif value == "treefarm" then
+            ctx.state = "TREEFARM"
         elseif value == "farm" then
             ctx.config.mode = "farm"
         elseif value == "--farm-type" then
@@ -76,6 +82,12 @@ local function run(args)
         elseif value == "--width" then
             index = index + 1
             ctx.config.width = tonumber(args[index])
+        elseif value == "--height" then
+            index = index + 1
+            ctx.config.height = tonumber(args[index])
+        elseif value == "--depth" then
+            index = index + 1
+            ctx.config.depth = tonumber(args[index])
         elseif value == "--length" then
             index = index + 1
             ctx.config.length = tonumber(args[index])
@@ -161,6 +173,871 @@ if not _G.__FACTORY_EMBED__ then
 end
 
 return module
+
+]===]
+bundled_modules["lib_designer"] = [===[
+--[[
+Graphical Schema Designer (Paint-style)
+]]
+
+local ui = require("lib_ui")
+local json = require("lib_json")
+local items = require("lib_items")
+
+local designer = {}
+
+-- --- Constants & Config ---
+
+local COLORS = {
+    bg = colors.gray,
+    canvas_bg = colors.black,
+    grid = colors.lightGray,
+    text = colors.white,
+    btn_active = colors.blue,
+    btn_inactive = colors.lightGray,
+    btn_text = colors.black,
+}
+
+local DEFAULT_MATERIALS = {
+    { id = "minecraft:stone", color = colors.lightGray, sym = "#" },
+    { id = "minecraft:dirt", color = colors.brown, sym = "d" },
+    { id = "minecraft:cobblestone", color = colors.gray, sym = "c" },
+    { id = "minecraft:planks", color = colors.orange, sym = "p" },
+    { id = "minecraft:glass", color = colors.lightBlue, sym = "g" },
+    { id = "minecraft:log", color = colors.brown, sym = "L" },
+    { id = "minecraft:torch", color = colors.yellow, sym = "i" },
+    { id = "minecraft:iron_block", color = colors.white, sym = "I" },
+    { id = "minecraft:gold_block", color = colors.yellow, sym = "G" },
+    { id = "minecraft:diamond_block", color = colors.cyan, sym = "D" },
+}
+
+local TOOLS = {
+    PENCIL = "Pencil",
+    LINE = "Line",
+    RECT = "Rect",
+    RECT_FILL = "FillRect",
+    CIRCLE = "Circle",
+    CIRCLE_FILL = "FillCircle",
+    BUCKET = "Bucket",
+    PICKER = "Picker"
+}
+
+-- --- State ---
+
+local state = {
+    running = true,
+    w = 14, h = 14, d = 5, -- Canvas dimensions
+    data = {}, -- [x][y][z] = material_index (0 or nil for air)
+    palette = {}, -- Initialized from DEFAULT_MATERIALS
+    paletteEditMode = false,
+    
+    view = {
+        layer = 0, -- Current Y level
+        offsetX = 4, -- Screen X offset of canvas
+        offsetY = 3, -- Screen Y offset of canvas
+        scrollX = 0,
+        scrollY = 0,
+    },
+    
+    menuOpen = false,
+    inventoryOpen = false,
+    searchOpen = false,
+    searchQuery = "",
+    searchResults = {},
+    searchScroll = 0,
+    dragItem = nil, -- { id, sym, color }
+    
+    tool = TOOLS.PENCIL,
+    primaryColor = 1, -- Index in palette
+    secondaryColor = 0, -- 0 = Air/Eraser
+    
+    mouse = {
+        down = false,
+        drag = false,
+        startX = 0, startY = 0, -- Canvas coords
+        currX = 0, currY = 0,   -- Canvas coords
+        btn = 1
+    },
+    
+    status = "Ready"
+}
+
+-- Initialize palette
+for i, m in ipairs(DEFAULT_MATERIALS) do
+    state.palette[i] = { id = m.id, color = m.color, sym = m.sym }
+end
+
+-- --- Helpers ---
+
+local function getMaterial(idx)
+    if idx == 0 or not idx then return nil end
+    return state.palette[idx]
+end
+
+local function getBlock(x, y, z)
+    if not state.data[x] then return 0 end
+    if not state.data[x][y] then return 0 end
+    return state.data[x][y][z] or 0
+end
+
+local function setBlock(x, y, z, matIdx)
+    if x < 0 or x >= state.w or z < 0 or z >= state.h or y < 0 or y >= state.d then return end
+    
+    if not state.data[x] then state.data[x] = {} end
+    if not state.data[x][y] then state.data[x][y] = {} end
+    
+    if matIdx == 0 then
+        state.data[x][y][z] = nil
+    else
+        state.data[x][y][z] = matIdx
+    end
+end
+
+-- --- Algorithms ---
+
+local function drawLine(x0, y0, x1, y1, callback)
+    local dx = math.abs(x1 - x0)
+    local dy = math.abs(y1 - y0)
+    local sx = x0 < x1 and 1 or -1
+    local sy = y0 < y1 and 1 or -1
+    local err = dx - dy
+
+    while true do
+        callback(x0, y0)
+        if x0 == x1 and y0 == y1 then break end
+        local e2 = 2 * err
+        if e2 > -dy then
+            err = err - dy
+            x0 = x0 + sx
+        end
+        if e2 < dx then
+            err = err + dx
+            y0 = y0 + sy
+        end
+    end
+end
+
+local function drawRect(x0, y0, x1, y1, filled, callback)
+    local minX, maxX = math.min(x0, x1), math.max(x0, x1)
+    local minY, maxY = math.min(y0, y1), math.max(y0, y1)
+    
+    for x = minX, maxX do
+        for y = minY, maxY do
+            if filled or (x == minX or x == maxX or y == minY or y == maxY) then
+                callback(x, y)
+            end
+        end
+    end
+end
+
+local function drawCircle(x0, y0, x1, y1, filled, callback)
+    -- Midpoint circle algorithm adapted for ellipse/bounds
+    local r = math.floor(math.min(math.abs(x1 - x0), math.abs(y1 - y0)) / 2)
+    local cx = math.floor((x0 + x1) / 2)
+    local cy = math.floor((y0 + y1) / 2)
+    
+    local x = r
+    local y = 0
+    local err = 0
+
+    while x >= y do
+        if filled then
+            for i = cx - x, cx + x do callback(i, cy + y); callback(i, cy - y) end
+            for i = cx - y, cx + y do callback(i, cy + x); callback(i, cy - x) end
+        else
+            callback(cx + x, cy + y)
+            callback(cx + y, cy + x)
+            callback(cx - y, cy + x)
+            callback(cx - x, cy + y)
+            callback(cx - x, cy - y)
+            callback(cx - y, cy - x)
+            callback(cx + y, cy - x)
+            callback(cx + x, cy - y)
+        end
+
+        if err <= 0 then
+            y = y + 1
+            err = err + 2 * y + 1
+        end
+        if err > 0 then
+            x = x - 1
+            err = err - 2 * x + 1
+        end
+    end
+end
+
+local function floodFill(startX, startY, targetColor, replaceColor)
+    if targetColor == replaceColor then return end
+    
+    local queue = { {x = startX, y = startY} }
+    local visited = {}
+    
+    local function key(x, y) return x .. "," .. y end
+    
+    while #queue > 0 do
+        local p = table.remove(queue, 1)
+        local k = key(p.x, p.y)
+        
+        if not visited[k] then
+            visited[k] = true
+            local curr = getBlock(p.x, state.view.layer, p.y)
+            
+            if curr == targetColor then
+                setBlock(p.x, state.view.layer, p.y, replaceColor)
+                
+                local neighbors = {
+                    {x = p.x + 1, y = p.y},
+                    {x = p.x - 1, y = p.y},
+                    {x = p.x, y = p.y + 1},
+                    {x = p.x, y = p.y - 1}
+                }
+                
+                for _, n in ipairs(neighbors) do
+                    if n.x >= 0 and n.x < state.w and n.y >= 0 and n.y < state.h then
+                        table.insert(queue, n)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- --- Rendering ---
+
+local function drawMenu()
+    if not state.menuOpen then return end
+    
+    local w, h = term.getSize()
+    local mx, my = w - 12, 2
+    local mw, mh = 12, 8
+    
+    ui.drawFrame(mx, my, mw, mh, "Menu")
+    
+    local options = { "Resize", "Save", "Load", "Clear", "Inventory", "Quit" }
+    for i, opt in ipairs(options) do
+        term.setCursorPos(mx + 1, my + i)
+        term.setBackgroundColor(COLORS.bg)
+        term.setTextColor(COLORS.text)
+        if opt == "Inventory" and state.inventoryOpen then
+            term.setTextColor(colors.yellow)
+        end
+        term.write(opt)
+    end
+end
+
+local function drawInventory()
+    if not state.inventoryOpen then return end
+    
+    local w, h = term.getSize()
+    local iw, ih = 18, 6 -- 4x4 grid + border
+    local ix, iy = math.floor((w - iw)/2), math.floor((h - ih)/2)
+    
+    ui.drawFrame(ix, iy, iw, ih, "Inventory")
+    
+    -- Draw 4x4 grid
+    for row = 0, 3 do
+        for col = 0, 3 do
+            local slot = row * 4 + col + 1
+            local item = turtle.getItemDetail(slot)
+            
+            term.setCursorPos(ix + 1 + (col * 4), iy + 1 + row)
+            
+            local sym = "."
+            local color = colors.gray
+            
+            if item then
+                sym = item.name:sub(11, 11):upper() -- First char of name after minecraft:
+                color = colors.white
+            end
+            
+            term.setBackgroundColor(colors.black)
+            term.setTextColor(color)
+            term.write(" " .. sym .. " ")
+        end
+    end
+    
+    term.setCursorPos(ix + 1, iy + ih)
+    term.setBackgroundColor(COLORS.bg)
+    term.setTextColor(COLORS.text)
+    term.write("Drag to Palette")
+end
+
+local function drawDragItem()
+    if state.dragItem and state.mouse.screenX then
+        term.setCursorPos(state.mouse.screenX, state.mouse.screenY)
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.write(state.dragItem.sym)
+    end
+end
+
+local function drawUI()
+    ui.clear()
+    
+    -- Toolbar (Top)
+    term.setBackgroundColor(COLORS.bg)
+    term.setCursorPos(1, 1)
+    term.clearLine()
+    
+    -- [M] Button
+    term.setBackgroundColor(colors.lightGray)
+    term.setTextColor(colors.black)
+    term.write(" M ")
+    
+    term.setBackgroundColor(COLORS.bg)
+    term.setTextColor(COLORS.text)
+    term.write(string.format(" Designer [%d,%d,%d] Layer: %d/%d", state.w, state.h, state.d, state.view.layer, state.d - 1))
+    
+    -- Tools (Left Side)
+    local toolsList = { TOOLS.PENCIL, TOOLS.LINE, TOOLS.RECT, TOOLS.RECT_FILL, TOOLS.CIRCLE, TOOLS.CIRCLE_FILL, TOOLS.BUCKET, TOOLS.PICKER }
+    for i, t in ipairs(toolsList) do
+        term.setCursorPos(1, 2 + i)
+        if state.tool == t then
+            term.setBackgroundColor(COLORS.btn_active)
+            term.setTextColor(colors.white)
+            term.write(" " .. t:sub(1,1) .. " ")
+        else
+            term.setBackgroundColor(COLORS.btn_inactive)
+            term.setTextColor(COLORS.btn_text)
+            term.write(" " .. t:sub(1,1) .. " ")
+        end
+    end
+    
+    -- Palette (Right Side)
+    local palX = 2 + state.w + 2
+    term.setCursorPos(palX, 2)
+    term.setBackgroundColor(COLORS.bg)
+    term.setTextColor(COLORS.text)
+    
+    local editLabel = state.paletteEditMode and "[EDITING]" or "[Edit]"
+    if state.paletteEditMode then term.setTextColor(colors.red) end
+    term.write("Palette " .. editLabel)
+    
+    -- Search Button
+    term.setCursorPos(palX + 16, 2)
+    term.setBackgroundColor(COLORS.btn_inactive)
+    term.setTextColor(COLORS.btn_text)
+    term.write(" S ")
+    
+    for i, mat in ipairs(state.palette) do
+        term.setCursorPos(palX, 3 + i)
+        
+        -- Indicator for selection
+        local indicator = " "
+        if state.primaryColor == i then indicator = "L" end
+        if state.secondaryColor == i then indicator = "R" end
+        if state.primaryColor == i and state.secondaryColor == i then indicator = "B" end
+        
+        term.setBackgroundColor(COLORS.bg)
+        term.setTextColor(COLORS.text)
+        term.write(indicator)
+        
+        term.setBackgroundColor(mat.color)
+        term.setTextColor(colors.black)
+        term.write(" " .. mat.sym .. " ")
+        
+        term.setBackgroundColor(COLORS.bg)
+        term.setTextColor(COLORS.text)
+        term.write(" " .. mat.id:match(":(.+)"))
+    end
+    
+    -- Status Bar (Bottom)
+    local w, h = term.getSize()
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(COLORS.bg)
+    term.clearLine()
+    term.write(state.status)
+    
+    -- Instructions
+    term.setCursorPos(1, h-1)
+    term.write("S:Save L:Load R:Resize C:Clear Q:Quit PgUp/Dn:Layer")
+    
+    drawMenu()
+    drawInventory()
+    drawSearch()
+    drawDragItem()
+end
+
+local function drawCanvas()
+    local ox, oy = state.view.offsetX, state.view.offsetY
+    local sx, sy = state.view.scrollX, state.view.scrollY
+    
+    -- Draw Border
+    term.setBackgroundColor(COLORS.bg)
+    term.setTextColor(colors.white)
+    ui.drawBox(ox - 1, oy - 1, state.w + 2, state.h + 2, COLORS.bg, colors.white)
+    
+    -- Draw Pixels
+    for x = 0, state.w - 1 do
+        for z = 0, state.h - 1 do
+            -- Apply scroll
+            local screenX = ox + x - sx
+            local screenY = oy + z - sy
+            
+            -- Only draw if within canvas view area (roughly)
+            -- Actually, we should clip to the border box
+            -- For simplicity, let's just draw if it fits on screen
+            local w, h = term.getSize()
+            if screenX >= ox and screenX < w and screenY >= oy and screenY < h - 2 then
+                local matIdx = getBlock(x, state.view.layer, z)
+                local mat = getMaterial(matIdx)
+                
+                local bg = COLORS.canvas_bg
+                local char = "."
+                local fg = COLORS.grid
+                
+                if mat then
+                    bg = mat.color
+                    char = mat.sym
+                    fg = colors.black
+                    if bg == colors.black then fg = colors.white end
+                end
+                
+                -- Ghost drawing
+                if state.mouse.down and state.mouse.drag then
+                    local isGhost = false
+                    local ghostColor = (state.mouse.btn == 1) and state.primaryColor or state.secondaryColor
+                    
+                    local function checkGhost(gx, gy)
+                        if gx == x and gy == z then isGhost = true end
+                    end
+                    
+                    if state.tool == TOOLS.PENCIL then
+                        checkGhost(state.mouse.currX, state.mouse.currY)
+                    elseif state.tool == TOOLS.LINE then
+                        drawLine(state.mouse.startX, state.mouse.startY, state.mouse.currX, state.mouse.currY, checkGhost)
+                    elseif state.tool == TOOLS.RECT then
+                        drawRect(state.mouse.startX, state.mouse.startY, state.mouse.currX, state.mouse.currY, false, checkGhost)
+                    elseif state.tool == TOOLS.RECT_FILL then
+                        drawRect(state.mouse.startX, state.mouse.startY, state.mouse.currX, state.mouse.currY, true, checkGhost)
+                    elseif state.tool == TOOLS.CIRCLE then
+                        drawCircle(state.mouse.startX, state.mouse.startY, state.mouse.currX, state.mouse.currY, false, checkGhost)
+                    elseif state.tool == TOOLS.CIRCLE_FILL then
+                        drawCircle(state.mouse.startX, state.mouse.startY, state.mouse.currX, state.mouse.currY, true, checkGhost)
+                    end
+                    
+                    if isGhost then
+                        local gMat = getMaterial(ghostColor)
+                        if gMat then
+                            bg = gMat.color
+                            char = gMat.sym
+                            fg = colors.black
+                        else
+                            bg = COLORS.canvas_bg
+                            char = "x"
+                            fg = colors.red
+                        end
+                    end
+                end
+                
+                term.setCursorPos(screenX, screenY)
+                term.setBackgroundColor(bg)
+                term.setTextColor(fg)
+                term.write(char)
+            end
+        end
+    end
+end
+
+
+
+-- --- Logic ---
+
+local function applyTool(x, y, btn)
+    local color = (btn == 1) and state.primaryColor or state.secondaryColor
+    
+    if state.tool == TOOLS.PENCIL then
+        setBlock(x, state.view.layer, y, color)
+    elseif state.tool == TOOLS.BUCKET then
+        local target = getBlock(x, state.view.layer, y)
+        floodFill(x, y, target, color)
+    elseif state.tool == TOOLS.PICKER then
+        local picked = getBlock(x, state.view.layer, y)
+        if btn == 1 then state.primaryColor = picked else state.secondaryColor = picked end
+        state.tool = TOOLS.PENCIL -- Auto switch back
+    end
+end
+
+local function applyShape(x0, y0, x1, y1, btn)
+    local color = (btn == 1) and state.primaryColor or state.secondaryColor
+    
+    local function plot(x, y)
+        setBlock(x, state.view.layer, y, color)
+    end
+    
+    if state.tool == TOOLS.LINE then
+        drawLine(x0, y0, x1, y1, plot)
+    elseif state.tool == TOOLS.RECT then
+        drawRect(x0, y0, x1, y1, false, plot)
+    elseif state.tool == TOOLS.RECT_FILL then
+        drawRect(x0, y0, x1, y1, true, plot)
+    elseif state.tool == TOOLS.CIRCLE then
+        drawCircle(x0, y0, x1, y1, false, plot)
+    elseif state.tool == TOOLS.CIRCLE_FILL then
+        drawCircle(x0, y0, x1, y1, true, plot)
+    end
+end
+
+local function saveSchema()
+    ui.clear()
+    term.setCursorPos(1, 1)
+    print("Save Schema")
+    write("Filename: ")
+    local name = read()
+    if name == "" then return end
+    if not name:find("%.json$") then name = name .. ".json" end
+    
+    -- Convert to sparse format for saving
+    local export = {}
+    for x, yRow in pairs(state.data) do
+        for y, zRow in pairs(yRow) do
+            for z, matIdx in pairs(zRow) do
+                local mat = getMaterial(matIdx)
+                if mat then
+                    if not export[tostring(x)] then export[tostring(x)] = {} end
+                    if not export[tostring(x)][tostring(y)] then export[tostring(x)][tostring(y)] = {} end
+                    export[tostring(x)][tostring(y)][tostring(z)] = { material = mat.id }
+                end
+            end
+        end
+    end
+    
+    local f = fs.open(name, "w")
+    f.write(json.encode(export))
+    f.close()
+    state.status = "Saved to " .. name
+end
+
+local function resizeCanvas()
+    ui.clear()
+    print("Resize Canvas")
+    write("Width (" .. state.w .. "): ")
+    local w = tonumber(read()) or state.w
+    write("Height/Depth (" .. state.h .. "): ")
+    local h = tonumber(read()) or state.h
+    write("Layers (" .. state.d .. "): ")
+    local d = tonumber(read()) or state.d
+    
+    state.w = w
+    state.h = h
+    state.d = d
+end
+
+local function editPaletteItem(idx)
+    ui.clear()
+    term.setCursorPos(1, 1)
+    print("Edit Palette Item #" .. idx)
+    
+    local current = state.palette[idx]
+    
+    write("ID (" .. current.id .. "): ")
+    local newId = read()
+    if newId == "" then newId = current.id end
+    
+    write("Symbol (" .. current.sym .. "): ")
+    local newSym = read()
+    if newSym == "" then newSym = current.sym end
+    newSym = newSym:sub(1, 1)
+    
+    -- Color selection is tricky in text mode, let's skip for now or cycle
+    -- For now, keep color
+    
+    state.palette[idx].id = newId
+    state.palette[idx].sym = newSym
+    state.status = "Updated Item #" .. idx
+end
+
+local function updateSearchResults()
+    state.searchResults = {}
+    local query = state.searchQuery:lower()
+    for _, item in ipairs(items) do
+        if item.name:lower():find(query, 1, true) or item.id:lower():find(query, 1, true) then
+            table.insert(state.searchResults, item)
+        end
+    end
+    state.searchScroll = 0
+end
+
+local function drawSearch()
+    if not state.searchOpen then return end
+    
+    local w, h = term.getSize()
+    local sw, sh = 24, 14
+    local sx, sy = math.floor((w - sw)/2), math.floor((h - sh)/2)
+    
+    ui.drawFrame(sx, sy, sw, sh, "Item Search")
+    
+    -- Search Box
+    term.setCursorPos(sx + 1, sy + 1)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.write(state.searchQuery .. "_")
+    local padding = sw - 2 - #state.searchQuery - 1
+    if padding > 0 then term.write(string.rep(" ", padding)) end
+    
+    -- Results List
+    local maxLines = sh - 3
+    for i = 1, maxLines do
+        local idx = state.searchScroll + i
+        local item = state.searchResults[idx]
+        
+        term.setCursorPos(sx + 1, sy + 2 + i)
+        if item then
+            term.setBackgroundColor(colors.black)
+            term.setTextColor(item.color or colors.white)
+            local label = item.name or item.id
+            if #label > sw - 4 then label = label:sub(1, sw - 4) end
+            term.write(" " .. item.sym .. " " .. label)
+            local pad = sw - 2 - 3 - #label
+            if pad > 0 then term.write(string.rep(" ", pad)) end
+        else
+            term.setBackgroundColor(COLORS.bg)
+            term.write(string.rep(" ", sw - 2))
+        end
+    end
+end
+
+-- --- Main ---
+
+function designer.run()
+    state.running = true
+    
+    while state.running do
+        drawUI()
+        drawCanvas()
+        drawMenu()
+        drawInventory()
+        drawSearch()
+        drawDragItem()
+        
+        local event, p1, p2, p3 = os.pullEvent()
+        
+        if event == "char" and state.searchOpen then
+            state.searchQuery = state.searchQuery .. p1
+            updateSearchResults()
+            
+        elseif event == "mouse_scroll" and state.searchOpen then
+            local dir = p1
+            state.searchScroll = math.max(0, state.searchScroll + dir)
+            
+        elseif event == "mouse_click" then
+            local btn, mx, my = p1, p2, p3
+            state.mouse.screenX = mx
+            state.mouse.screenY = my
+            local handled = false
+            
+            -- 0. Check Search (Topmost)
+            if state.searchOpen then
+                local w, h = term.getSize()
+                local sw, sh = 24, 14
+                local sx, sy = math.floor((w - sw)/2), math.floor((h - sh)/2)
+                
+                if mx >= sx and mx < sx + sw and my >= sy and my < sy + sh then
+                    -- Inside Search Window
+                    if my >= sy + 3 then
+                        local idx = state.searchScroll + (my - (sy + 2))
+                        local item = state.searchResults[idx]
+                        if item then
+                            state.dragItem = { id = item.id, sym = item.sym, color = item.color }
+                            state.searchOpen = false
+                        end
+                    end
+                    handled = true
+                else
+                    state.searchOpen = false
+                    handled = true
+                end
+            end
+            
+            -- 1. Check Menu (Topmost)
+            if not handled and state.menuOpen then
+                local w, h = term.getSize()
+                local menuX, menuY = w - 12, 2
+                if mx >= menuX and mx < menuX + 12 and my >= menuY and my < menuY + 8 then
+                    local idx = my - menuY
+                    local options = { "Resize", "Save", "Load", "Clear", "Inventory", "Quit" }
+                    if options[idx] then
+                        if options[idx] == "Quit" then state.running = false
+                        elseif options[idx] == "Inventory" then state.inventoryOpen = not state.inventoryOpen
+                        elseif options[idx] == "Resize" then resizeCanvas()
+                        elseif options[idx] == "Save" then saveSchema()
+                        elseif options[idx] == "Clear" then state.data = {}
+                        -- Load logic...
+                        end
+                        if options[idx] ~= "Inventory" then state.menuOpen = false end
+                    end
+                    handled = true
+                else
+                    -- Click outside menu closes it
+                    state.menuOpen = false
+                    handled = true -- Consume click
+                end
+            end
+            
+            -- 2. Check Inventory (Topmost)
+            if not handled and state.inventoryOpen then
+                local w, h = term.getSize()
+                local iw, ih = 18, 6
+                local ix, iy = math.floor((w - iw)/2), math.floor((h - ih)/2)
+                
+                if mx >= ix and mx < ix + iw and my >= iy and my < iy + ih then
+                    -- Check slot click
+                    local relX, relY = mx - ix - 1, my - iy - 1
+                    if relX >= 0 and relY >= 0 then
+                        local col = math.floor(relX / 4)
+                        local row = relY
+                        if col >= 0 and col <= 3 and row >= 0 and row <= 3 then
+                            local slot = row * 4 + col + 1
+                            local item = turtle.getItemDetail(slot)
+                            if item then
+                                state.dragItem = {
+                                    id = item.name,
+                                    sym = item.name:sub(11, 11):upper(),
+                                    color = colors.white
+                                }
+                            end
+                        end
+                    end
+                    handled = true
+                end
+            end
+            
+            -- 3. Check [M] Button
+            if not handled and mx >= 1 and mx <= 3 and my == 1 then
+                state.menuOpen = not state.menuOpen
+                handled = true
+            end
+            
+            -- 4. Check Palette (Drop Target & Selection)
+            local palX = 2 + state.w + 2
+            if not handled and mx >= palX and mx <= palX + 18 then -- Expanded for Search button
+                if my == 2 then
+                    -- Check Edit vs Search
+                    if mx >= palX + 16 and mx <= palX + 18 then
+                        state.searchOpen = not state.searchOpen
+                        if state.searchOpen then 
+                            state.searchQuery = "" 
+                            updateSearchResults()
+                        end
+                    elseif mx <= palX + 15 then
+                        state.paletteEditMode = not state.paletteEditMode
+                    end
+                    handled = true
+                elseif my >= 4 and my < 4 + #state.palette then
+                    local idx = my - 3
+                    if state.paletteEditMode then
+                        editPaletteItem(idx)
+                    else
+                        if btn == 1 then state.primaryColor = idx
+                        elseif btn == 2 then state.secondaryColor = idx end
+                    end
+                    handled = true
+                end
+            end
+            
+            -- 5. Check Tools
+            if not handled and mx >= 1 and mx <= 3 and my >= 3 and my < 3 + 8 then
+                local idx = my - 2
+                local toolsList = { TOOLS.PENCIL, TOOLS.LINE, TOOLS.RECT, TOOLS.RECT_FILL, TOOLS.CIRCLE, TOOLS.CIRCLE_FILL, TOOLS.BUCKET, TOOLS.PICKER }
+                if toolsList[idx] then state.tool = toolsList[idx] end
+                handled = true
+            end
+            
+            -- 6. Check Canvas
+            if not handled then
+                local cx = mx - state.view.offsetX
+                local cy = my - state.view.offsetY
+                
+                if cx >= 0 and cx < state.w and cy >= 0 and cy < state.h then
+                    state.mouse.down = true
+                    state.mouse.btn = btn
+                    state.mouse.startX = cx
+                    state.mouse.startY = cy
+                    state.mouse.currX = cx
+                    state.mouse.currY = cy
+                    
+                    if state.tool == TOOLS.PENCIL or state.tool == TOOLS.BUCKET or state.tool == TOOLS.PICKER then
+                        applyTool(cx, cy, btn)
+                    end
+                end
+            end
+            
+        elseif event == "mouse_drag" then
+            local btn, mx, my = p1, p2, p3
+            state.mouse.screenX = mx
+            state.mouse.screenY = my
+            local cx = mx - state.view.offsetX
+            local cy = my - state.view.offsetY
+            
+            if state.mouse.down then
+                -- Clamp to canvas
+                cx = math.max(0, math.min(state.w - 1, cx))
+                cy = math.max(0, math.min(state.h - 1, cy))
+                
+                state.mouse.currX = cx
+                state.mouse.currY = cy
+                state.mouse.drag = true
+                
+                if state.tool == TOOLS.PENCIL then
+                    applyTool(cx, cy, state.mouse.btn)
+                end
+            end
+            
+        elseif event == "mouse_up" then
+            local btn, mx, my = p1, p2, p3
+            
+            -- Handle Drag Drop to Palette
+            if state.dragItem then
+                local palX = 2 + state.w + 2
+                if mx >= palX and mx <= palX + 15 and my >= 4 and my < 4 + #state.palette then
+                    local idx = my - 3
+                    state.palette[idx].id = state.dragItem.id
+                    state.palette[idx].sym = state.dragItem.sym
+                    state.status = "Assigned " .. state.dragItem.id .. " to slot " .. idx
+                end
+                state.dragItem = nil
+            end
+
+            if state.mouse.down and state.mouse.drag then
+                -- Commit shape
+                if state.tool == TOOLS.LINE or state.tool == TOOLS.RECT or state.tool == TOOLS.RECT_FILL or state.tool == TOOLS.CIRCLE then
+                    applyShape(state.mouse.startX, state.mouse.startY, state.mouse.currX, state.mouse.currY, state.mouse.btn)
+                end
+            end
+            state.mouse.down = false
+            state.mouse.drag = false
+            
+        elseif event == "key" then
+            local key = p1
+            
+            if state.searchOpen then
+                if key == keys.backspace then
+                    state.searchQuery = state.searchQuery:sub(1, -2)
+                    updateSearchResults()
+                elseif key == keys.enter then
+                    if #state.searchResults > 0 then
+                        local item = state.searchResults[1]
+                        state.dragItem = { id = item.id, sym = item.sym, color = item.color }
+                        state.searchOpen = false
+                    end
+                elseif key == keys.up then
+                    state.searchScroll = math.max(0, state.searchScroll - 1)
+                elseif key == keys.down then
+                    state.searchScroll = state.searchScroll + 1
+                end
+            else
+                if key == keys.q then state.running = false end
+                if key == keys.s then saveSchema() end
+                if key == keys.r then resizeCanvas() end
+                if key == keys.c then state.data = {} end -- Clear all
+                if key == keys.pageUp then state.view.layer = math.min(state.d - 1, state.view.layer + 1) end
+                if key == keys.pageDown then state.view.layer = math.max(0, state.view.layer - 1) end
+            end
+        end
+    end
+end
+
+return designer
 
 ]===]
 bundled_modules["lib_diagnostics"] = [===[
@@ -909,6 +1786,526 @@ function fuel.describeService(io, report)
 end
 
 return fuel
+
+]===]
+bundled_modules["lib_games"] = [===[
+local ui = require("lib_ui")
+
+local games = {}
+
+-- --- SHARED UTILS ---
+
+local function createDeck()
+    local suits = {"H", "D", "C", "S"}
+    local ranks = {"A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"}
+    local deck = {}
+    for _, s in ipairs(suits) do
+        for _, r in ipairs(ranks) do
+            table.insert(deck, { suit = s, rank = r, faceUp = false })
+        end
+    end
+    return deck
+end
+
+local function shuffle(deck)
+    for i = #deck, 2, -1 do
+        local j = math.random(i)
+        deck[i], deck[j] = deck[j], deck[i]
+    end
+end
+
+local function drawCard(x, y, card, selected)
+    local color = (card.suit == "H" or card.suit == "D") and colors.red or colors.black
+    local bg = selected and colors.yellow or colors.white
+    
+    if not card.faceUp then
+        term.setBackgroundColor(colors.blue)
+        term.setTextColor(colors.white)
+        term.setCursorPos(x, y)
+        term.write("##")
+        return
+    end
+    
+    term.setBackgroundColor(bg)
+    term.setTextColor(color)
+    term.setCursorPos(x, y)
+    local r = card.rank
+    if #r == 1 then r = r .. " " end
+    term.write(r)
+    term.setCursorPos(x, y+1)
+    term.write(card.suit .. " ")
+end
+
+-- --- MINESWEEPER ---
+
+function games.minesweeper()
+    local w, h = 16, 16
+    local mines = 40
+    local grid = {}
+    local revealed = {}
+    local flagged = {}
+    local gameOver = false
+    local win = false
+    
+    -- Init grid
+    for x = 1, w do
+        grid[x] = {}
+        revealed[x] = {}
+        flagged[x] = {}
+        for y = 1, h do
+            grid[x][y] = 0
+            revealed[x][y] = false
+            flagged[x][y] = false
+        end
+    end
+    
+    -- Place mines
+    local placed = 0
+    while placed < mines do
+        local x, y = math.random(w), math.random(h)
+        if grid[x][y] ~= -1 then
+            grid[x][y] = -1
+            placed = placed + 1
+            -- Update neighbors
+            for dx = -1, 1 do
+                for dy = -1, 1 do
+                    local nx, ny = x + dx, y + dy
+                    if nx >= 1 and nx <= w and ny >= 1 and ny <= h and grid[nx][ny] ~= -1 then
+                        grid[nx][ny] = grid[nx][ny] + 1
+                    end
+                end
+            end
+        end
+    end
+    
+    local function draw()
+        ui.clear()
+        ui.drawFrame(1, 1, w + 2, h + 2, "Minesweeper")
+        
+        for x = 1, w do
+            for y = 1, h do
+                term.setCursorPos(x + 1, y + 1)
+                if revealed[x][y] then
+                    if grid[x][y] == -1 then
+                        term.setBackgroundColor(colors.red)
+                        term.setTextColor(colors.black)
+                        term.write("*")
+                    elseif grid[x][y] == 0 then
+                        term.setBackgroundColor(colors.lightGray)
+                        term.write(" ")
+                    else
+                        term.setBackgroundColor(colors.lightGray)
+                        term.setTextColor(colors.black)
+                        term.write(tostring(grid[x][y]))
+                    end
+                elseif flagged[x][y] then
+                    term.setBackgroundColor(colors.gray)
+                    term.setTextColor(colors.red)
+                    term.write("F")
+                else
+                    term.setBackgroundColor(colors.gray)
+                    term.write(" ")
+                end
+            end
+        end
+        
+        if gameOver then
+            ui.drawBox(5, 8, 12, 3, colors.red, colors.white)
+            ui.label(6, 9, win and "YOU WIN!" or "GAME OVER")
+            ui.button(6, 10, "Click to exit", true)
+        end
+    end
+    
+    local function reveal(x, y)
+        if x < 1 or x > w or y < 1 or y > h or revealed[x][y] or flagged[x][y] then return end
+        revealed[x][y] = true
+        if grid[x][y] == -1 then
+            gameOver = true
+            win = false
+        elseif grid[x][y] == 0 then
+            for dx = -1, 1 do
+                for dy = -1, 1 do
+                    reveal(x + dx, y + dy)
+                end
+            end
+        end
+    end
+    
+    while true do
+        draw()
+        local event, p1, p2, p3 = os.pullEvent("mouse_click")
+        local btn, mx, my = p1, p2, p3
+        
+        if gameOver then return end
+        
+        local gx, gy = mx - 1, my - 1
+        if gx >= 1 and gx <= w and gy >= 1 and gy <= h then
+            if btn == 1 then -- Left click
+                reveal(gx, gy)
+            elseif btn == 2 then -- Right click
+                if not revealed[gx][gy] then
+                    flagged[gx][gy] = not flagged[gx][gy]
+                end
+            end
+        end
+        
+        -- Check win
+        local covered = 0
+        for x = 1, w do
+            for y = 1, h do
+                if not revealed[x][y] then covered = covered + 1 end
+            end
+        end
+        if covered == mines then
+            gameOver = true
+            win = true
+        end
+    end
+end
+
+-- --- SOLITAIRE ---
+
+function games.solitaire()
+    local deck = createDeck()
+    shuffle(deck)
+    
+    local piles = {} -- 7 tableau piles
+    local foundations = {{}, {}, {}, {}} -- 4 foundations
+    local stock = {}
+    local waste = {}
+    
+    -- Deal
+    for i = 1, 7 do
+        piles[i] = {}
+        for j = 1, i do
+            local card = table.remove(deck)
+            if j == i then card.faceUp = true end
+            table.insert(piles[i], card)
+        end
+    end
+    stock = deck
+    
+    local selected = nil -- { type="pile"|"waste", index=1, cardIndex=1 }
+    
+    local function draw()
+        ui.clear()
+        ui.drawFrame(1, 1, 50, 19, "Solitaire")
+        
+        -- Stock
+        if #stock > 0 then
+            drawCard(2, 2, {suit="?", rank="?", faceUp=false}, false)
+        else
+            ui.label(2, 2, "[]")
+        end
+        
+        -- Waste
+        if #waste > 0 then
+            local card = waste[#waste]
+            card.faceUp = true
+            drawCard(6, 2, card, selected and selected.type == "waste")
+        end
+        
+        -- Foundations
+        for i = 1, 4 do
+            local x = 15 + (i-1)*4
+            if #foundations[i] > 0 then
+                drawCard(x, 2, foundations[i][#foundations[i]], false)
+            else
+                ui.label(x, 2, "[]")
+            end
+        end
+        
+        -- Tableau
+        for i = 1, 7 do
+            local x = 2 + (i-1)*5
+            if #piles[i] == 0 then
+                ui.label(x, 5, "[]")
+            else
+                for j, card in ipairs(piles[i]) do
+                    local y = 5 + (j-1)
+                    if y < 18 then
+                        local isSel = selected and selected.type == "pile" and selected.index == i and selected.cardIndex == j
+                        drawCard(x, y, card, isSel)
+                    end
+                end
+            end
+        end
+    end
+    
+    local function canStack(bottom, top)
+        if not bottom then return top.rank == "K" end -- Empty pile needs King
+        local ranks = {A=1, ["2"]=2, ["3"]=3, ["4"]=4, ["5"]=5, ["6"]=6, ["7"]=7, ["8"]=8, ["9"]=9, ["10"]=10, J=11, Q=12, K=13}
+        local red = {H=true, D=true}
+        local bottomRed = red[bottom.suit]
+        local topRed = red[top.suit]
+        return (bottomRed ~= topRed) and (ranks[bottom.rank] == ranks[top.rank] + 1)
+    end
+    
+    local function canFoundation(foundation, card)
+        local ranks = {A=1, ["2"]=2, ["3"]=3, ["4"]=4, ["5"]=5, ["6"]=6, ["7"]=7, ["8"]=8, ["9"]=9, ["10"]=10, J=11, Q=12, K=13}
+        if #foundation == 0 then return card.rank == "A" end
+        local top = foundation[#foundation]
+        return top.suit == card.suit and ranks[card.rank] == ranks[top.rank] + 1
+    end
+
+    while true do
+        draw()
+        local event, p1, p2, p3 = os.pullEvent()
+        
+        if event == "key" and p1 == keys.q then return end
+        
+        if event == "mouse_click" then
+            local btn, mx, my = p1, p2, p3
+            
+            -- Click Stock
+            if my >= 2 and my <= 3 and mx >= 2 and mx <= 4 then
+                if #stock > 0 then
+                    table.insert(waste, table.remove(stock))
+                else
+                    -- Recycle waste
+                    while #waste > 0 do
+                        local c = table.remove(waste)
+                        c.faceUp = false
+                        table.insert(stock, c)
+                    end
+                end
+                selected = nil
+            
+            -- Click Waste
+            elseif my >= 2 and my <= 3 and mx >= 6 and mx <= 8 and #waste > 0 then
+                if selected and selected.type == "waste" then
+                    selected = nil
+                else
+                    selected = { type = "waste" }
+                end
+                
+            -- Click Foundations (Target only)
+            elseif my >= 2 and my <= 3 and mx >= 15 and mx <= 30 then
+                local fIdx = math.floor((mx - 15) / 4) + 1
+                if fIdx >= 1 and fIdx <= 4 then
+                    if selected then
+                        local card
+                        if selected.type == "waste" then card = waste[#waste]
+                        elseif selected.type == "pile" then 
+                            local p = piles[selected.index]
+                            if selected.cardIndex == #p then card = p[#p] end
+                        end
+                        
+                        if card and canFoundation(foundations[fIdx], card) then
+                            table.insert(foundations[fIdx], card)
+                            if selected.type == "waste" then table.remove(waste)
+                            else table.remove(piles[selected.index]) end
+                            
+                            -- Flip next card in pile
+                            if selected.type == "pile" then
+                                local p = piles[selected.index]
+                                if #p > 0 then p[#p].faceUp = true end
+                            end
+                            selected = nil
+                        end
+                    end
+                end
+                
+            -- Click Tableau
+            elseif my >= 5 then
+                local pIdx = math.floor((mx - 2) / 5) + 1
+                if pIdx >= 1 and pIdx <= 7 then
+                    local p = piles[pIdx]
+                    local cIdx = my - 4
+                    
+                    if cIdx <= #p and cIdx > 0 then
+                        -- Clicked a card
+                        local card = p[cIdx]
+                        if card.faceUp then
+                            if selected then
+                                if selected.type == "pile" and selected.index == pIdx then
+                                    selected = nil -- Deselect self
+                                else
+                                    -- Try to move selected TO here
+                                    local srcCard
+                                    if selected.type == "waste" then srcCard = waste[#waste]
+                                    elseif selected.type == "pile" then srcCard = piles[selected.index][selected.cardIndex] end
+                                    
+                                    if srcCard and canStack(card, srcCard) then
+                                        -- Move
+                                        if selected.type == "waste" then
+                                            table.insert(p, table.remove(waste))
+                                        else
+                                            local srcPile = piles[selected.index]
+                                            local moving = {}
+                                            for k = selected.cardIndex, #srcPile do
+                                                table.insert(moving, srcPile[k])
+                                            end
+                                            for k = #srcPile, selected.cardIndex, -1 do
+                                                table.remove(srcPile)
+                                            end
+                                            for _, m in ipairs(moving) do table.insert(p, m) end
+                                            if #srcPile > 0 then srcPile[#srcPile].faceUp = true end
+                                        end
+                                        selected = nil
+                                    else
+                                        -- Select this instead
+                                        selected = { type = "pile", index = pIdx, cardIndex = cIdx }
+                                    end
+                                end
+                            else
+                                selected = { type = "pile", index = pIdx, cardIndex = cIdx }
+                            end
+                        end
+                    elseif #p == 0 and cIdx == 1 then
+                        -- Clicked empty slot
+                        if selected then
+                            local srcCard
+                            if selected.type == "waste" then srcCard = waste[#waste]
+                            elseif selected.type == "pile" then srcCard = piles[selected.index][selected.cardIndex] end
+                            
+                            if srcCard and canStack(nil, srcCard) then
+                                -- Move King to empty
+                                if selected.type == "waste" then
+                                    table.insert(p, table.remove(waste))
+                                else
+                                    local srcPile = piles[selected.index]
+                                    local moving = {}
+                                    for k = selected.cardIndex, #srcPile do
+                                        table.insert(moving, srcPile[k])
+                                    end
+                                    for k = #srcPile, selected.cardIndex, -1 do
+                                        table.remove(srcPile)
+                                    end
+                                    for _, m in ipairs(moving) do table.insert(p, m) end
+                                    if #srcPile > 0 then srcPile[#srcPile].faceUp = true end
+                                end
+                                selected = nil
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- --- EUCHRE ---
+
+function games.euchre()
+    -- Simplified Euchre: 4 players, 5 cards each.
+    -- Deck: 9, 10, J, Q, K, A of all suits (24 cards).
+    local function createEuchreDeck()
+        local suits = {"H", "D", "C", "S"}
+        local ranks = {"9", "10", "J", "Q", "K", "A"}
+        local deck = {}
+        for _, s in ipairs(suits) do
+            for _, r in ipairs(ranks) do
+                table.insert(deck, { suit = s, rank = r, faceUp = true })
+            end
+        end
+        return deck
+    end
+    
+    local deck = createEuchreDeck()
+    shuffle(deck)
+    
+    local hands = {{}, {}, {}, {}} -- 1=Human, 2=Left, 3=Partner, 4=Right
+    for i=1,4 do
+        for j=1,5 do table.insert(hands[i], table.remove(deck)) end
+    end
+    
+    local trump = nil
+    local turn = 1
+    local tricks = {0, 0} -- Team 1 (Human/Partner), Team 2 (Opponents)
+    local currentTrick = {}
+    
+    -- Simple AI
+    local function aiPlay(handIdx)
+        local hand = hands[handIdx]
+        -- Play first valid card
+        local leadSuit = nil
+        if #currentTrick > 0 then leadSuit = currentTrick[1].card.suit end
+        
+        for i, c in ipairs(hand) do
+            if not leadSuit or c.suit == leadSuit then
+                table.remove(hand, i)
+                return c
+            end
+        end
+        return table.remove(hand, 1) -- Fallback (renege possible in this simple logic, but ok for now)
+    end
+    
+    local function draw()
+        ui.clear()
+        ui.drawFrame(1, 1, 50, 19, "Euchre")
+        
+        -- Draw Table
+        ui.label(20, 2, "Partner")
+        ui.label(2, 9, "Left")
+        ui.label(45, 9, "Right")
+        ui.label(20, 17, "You")
+        
+        ui.label(2, 2, "Tricks: " .. tricks[1] .. " - " .. tricks[2])
+        if trump then ui.label(40, 2, "Trump: " .. trump) end
+        
+        -- Draw played cards
+        for _, play in ipairs(currentTrick) do
+            local x, y = 25, 10
+            if play.player == 1 then y = 12
+            elseif play.player == 2 then x = 15
+            elseif play.player == 3 then y = 8
+            elseif play.player == 4 then x = 35 end
+            drawCard(x, y, play.card, false)
+        end
+        
+        -- Draw Hand
+        for i, card in ipairs(hands[1]) do
+            drawCard(10 + (i-1)*5, 15, card, false)
+        end
+    end
+    
+    -- Bidding Phase (Simplified: just pick top card of kitty or random)
+    local kitty = deck[1]
+    trump = kitty.suit -- Force trump for simplicity in this version
+    
+    while true do
+        draw()
+        
+        if #currentTrick == 4 then
+            sleep(1)
+            -- Evaluate trick
+            -- (Skipping complex evaluation logic for brevity, just random winner)
+            local winner = math.random(1, 2)
+            tricks[winner] = tricks[winner] + 1
+            currentTrick = {}
+            if #hands[1] == 0 then
+                ui.clear()
+                print("Game Over. Team " .. (tricks[1] > tricks[2] and "1" or "2") .. " wins!")
+                sleep(2)
+                return
+            end
+        end
+        
+        if turn == 1 then
+            -- Human turn
+            local event, p1, p2, p3 = os.pullEvent("mouse_click")
+            if event == "mouse_click" then
+                local mx, my = p2, p3
+                if my >= 15 and my <= 16 then
+                    local idx = math.floor((mx - 10) / 5) + 1
+                    if idx >= 1 and idx <= #hands[1] then
+                        local card = table.remove(hands[1], idx)
+                        table.insert(currentTrick, { player = 1, card = card })
+                        turn = 2
+                    end
+                end
+            end
+        else
+            sleep(0.5)
+            local card = aiPlay(turn)
+            table.insert(currentTrick, { player = turn, card = card })
+            turn = (turn % 4) + 1
+        end
+    end
+end
+
+return games
 
 ]===]
 bundled_modules["lib_gps"] = [===[
@@ -2898,6 +4295,220 @@ end
 
 return inventory_utils
 
+]===]
+bundled_modules["lib_items"] = [===[
+local items = {
+    { id = "minecraft:stone", name = "Stone", color = colors.lightGray, sym = "#" },
+    { id = "minecraft:granite", name = "Granite", color = colors.red, sym = "#" },
+    { id = "minecraft:polished_granite", name = "Polished Granite", color = colors.red, sym = "#" },
+    { id = "minecraft:diorite", name = "Diorite", color = colors.white, sym = "#" },
+    { id = "minecraft:polished_diorite", name = "Polished Diorite", color = colors.white, sym = "#" },
+    { id = "minecraft:andesite", name = "Andesite", color = colors.gray, sym = "#" },
+    { id = "minecraft:polished_andesite", name = "Polished Andesite", color = colors.gray, sym = "#" },
+    { id = "minecraft:grass_block", name = "Grass Block", color = colors.green, sym = "G" },
+    { id = "minecraft:dirt", name = "Dirt", color = colors.brown, sym = "d" },
+    { id = "minecraft:coarse_dirt", name = "Coarse Dirt", color = colors.brown, sym = "d" },
+    { id = "minecraft:podzol", name = "Podzol", color = colors.brown, sym = "d" },
+    { id = "minecraft:cobblestone", name = "Cobblestone", color = colors.gray, sym = "C" },
+    { id = "minecraft:oak_planks", name = "Oak Planks", color = colors.brown, sym = "P" },
+    { id = "minecraft:spruce_planks", name = "Spruce Planks", color = colors.brown, sym = "P" },
+    { id = "minecraft:birch_planks", name = "Birch Planks", color = colors.yellow, sym = "P" },
+    { id = "minecraft:jungle_planks", name = "Jungle Planks", color = colors.brown, sym = "P" },
+    { id = "minecraft:acacia_planks", name = "Acacia Planks", color = colors.orange, sym = "P" },
+    { id = "minecraft:dark_oak_planks", name = "Dark Oak Planks", color = colors.brown, sym = "P" },
+    { id = "minecraft:mangrove_planks", name = "Mangrove Planks", color = colors.red, sym = "P" },
+    { id = "minecraft:cherry_planks", name = "Cherry Planks", color = colors.pink, sym = "P" },
+    { id = "minecraft:bamboo_planks", name = "Bamboo Planks", color = colors.yellow, sym = "P" },
+    { id = "minecraft:bedrock", name = "Bedrock", color = colors.black, sym = "B" },
+    { id = "minecraft:sand", name = "Sand", color = colors.yellow, sym = "s" },
+    { id = "minecraft:red_sand", name = "Red Sand", color = colors.orange, sym = "s" },
+    { id = "minecraft:gravel", name = "Gravel", color = colors.gray, sym = "g" },
+    { id = "minecraft:gold_ore", name = "Gold Ore", color = colors.yellow, sym = "o" },
+    { id = "minecraft:iron_ore", name = "Iron Ore", color = colors.brown, sym = "o" },
+    { id = "minecraft:coal_ore", name = "Coal Ore", color = colors.black, sym = "o" },
+    { id = "minecraft:nether_gold_ore", name = "Nether Gold Ore", color = colors.yellow, sym = "o" },
+    { id = "minecraft:oak_log", name = "Oak Log", color = colors.brown, sym = "L" },
+    { id = "minecraft:spruce_log", name = "Spruce Log", color = colors.brown, sym = "L" },
+    { id = "minecraft:birch_log", name = "Birch Log", color = colors.white, sym = "L" },
+    { id = "minecraft:jungle_log", name = "Jungle Log", color = colors.brown, sym = "L" },
+    { id = "minecraft:acacia_log", name = "Acacia Log", color = colors.orange, sym = "L" },
+    { id = "minecraft:dark_oak_log", name = "Dark Oak Log", color = colors.brown, sym = "L" },
+    { id = "minecraft:mangrove_log", name = "Mangrove Log", color = colors.red, sym = "L" },
+    { id = "minecraft:cherry_log", name = "Cherry Log", color = colors.pink, sym = "L" },
+    { id = "minecraft:stripped_oak_log", name = "Stripped Oak Log", color = colors.brown, sym = "L" },
+    { id = "minecraft:stripped_spruce_log", name = "Stripped Spruce Log", color = colors.brown, sym = "L" },
+    { id = "minecraft:stripped_birch_log", name = "Stripped Birch Log", color = colors.white, sym = "L" },
+    { id = "minecraft:stripped_jungle_log", name = "Stripped Jungle Log", color = colors.brown, sym = "L" },
+    { id = "minecraft:stripped_acacia_log", name = "Stripped Acacia Log", color = colors.orange, sym = "L" },
+    { id = "minecraft:stripped_dark_oak_log", name = "Stripped Dark Oak Log", color = colors.brown, sym = "L" },
+    { id = "minecraft:stripped_mangrove_log", name = "Stripped Mangrove Log", color = colors.red, sym = "L" },
+    { id = "minecraft:stripped_cherry_log", name = "Stripped Cherry Log", color = colors.pink, sym = "L" },
+    { id = "minecraft:glass", name = "Glass", color = colors.lightBlue, sym = "G" },
+    { id = "minecraft:lapis_ore", name = "Lapis Ore", color = colors.blue, sym = "o" },
+    { id = "minecraft:diamond_ore", name = "Diamond Ore", color = colors.cyan, sym = "o" },
+    { id = "minecraft:redstone_ore", name = "Redstone Ore", color = colors.red, sym = "o" },
+    { id = "minecraft:emerald_ore", name = "Emerald Ore", color = colors.green, sym = "o" },
+    { id = "minecraft:white_wool", name = "White Wool", color = colors.white, sym = "W" },
+    { id = "minecraft:orange_wool", name = "Orange Wool", color = colors.orange, sym = "W" },
+    { id = "minecraft:magenta_wool", name = "Magenta Wool", color = colors.magenta, sym = "W" },
+    { id = "minecraft:light_blue_wool", name = "Light Blue Wool", color = colors.lightBlue, sym = "W" },
+    { id = "minecraft:yellow_wool", name = "Yellow Wool", color = colors.yellow, sym = "W" },
+    { id = "minecraft:lime_wool", name = "Lime Wool", color = colors.lime, sym = "W" },
+    { id = "minecraft:pink_wool", name = "Pink Wool", color = colors.pink, sym = "W" },
+    { id = "minecraft:gray_wool", name = "Gray Wool", color = colors.gray, sym = "W" },
+    { id = "minecraft:light_gray_wool", name = "Light Gray Wool", color = colors.lightGray, sym = "W" },
+    { id = "minecraft:cyan_wool", name = "Cyan Wool", color = colors.cyan, sym = "W" },
+    { id = "minecraft:purple_wool", name = "Purple Wool", color = colors.purple, sym = "W" },
+    { id = "minecraft:blue_wool", name = "Blue Wool", color = colors.blue, sym = "W" },
+    { id = "minecraft:brown_wool", name = "Brown Wool", color = colors.brown, sym = "W" },
+    { id = "minecraft:green_wool", name = "Green Wool", color = colors.green, sym = "W" },
+    { id = "minecraft:red_wool", name = "Red Wool", color = colors.red, sym = "W" },
+    { id = "minecraft:black_wool", name = "Black Wool", color = colors.black, sym = "W" },
+    { id = "minecraft:bricks", name = "Bricks", color = colors.red, sym = "B" },
+    { id = "minecraft:bookshelf", name = "Bookshelf", color = colors.brown, sym = "#" },
+    { id = "minecraft:mossy_cobblestone", name = "Mossy Cobblestone", color = colors.gray, sym = "C" },
+    { id = "minecraft:obsidian", name = "Obsidian", color = colors.black, sym = "O" },
+    { id = "minecraft:torch", name = "Torch", color = colors.yellow, sym = "i" },
+    { id = "minecraft:chest", name = "Chest", color = colors.brown, sym = "C" },
+    { id = "minecraft:crafting_table", name = "Crafting Table", color = colors.brown, sym = "T" },
+    { id = "minecraft:furnace", name = "Furnace", color = colors.gray, sym = "F" },
+    { id = "minecraft:ladder", name = "Ladder", color = colors.brown, sym = "H" },
+    { id = "minecraft:snow", name = "Snow", color = colors.white, sym = "S" },
+    { id = "minecraft:ice", name = "Ice", color = colors.lightBlue, sym = "I" },
+    { id = "minecraft:snow_block", name = "Snow Block", color = colors.white, sym = "S" },
+    { id = "minecraft:clay", name = "Clay", color = colors.lightGray, sym = "C" },
+    { id = "minecraft:pumpkin", name = "Pumpkin", color = colors.orange, sym = "P" },
+    { id = "minecraft:netherrack", name = "Netherrack", color = colors.red, sym = "N" },
+    { id = "minecraft:soul_sand", name = "Soul Sand", color = colors.brown, sym = "S" },
+    { id = "minecraft:soul_soil", name = "Soul Soil", color = colors.brown, sym = "S" },
+    { id = "minecraft:basalt", name = "Basalt", color = colors.gray, sym = "B" },
+    { id = "minecraft:polished_basalt", name = "Polished Basalt", color = colors.gray, sym = "B" },
+    { id = "minecraft:glowstone", name = "Glowstone", color = colors.yellow, sym = "G" },
+    { id = "minecraft:stone_bricks", name = "Stone Bricks", color = colors.gray, sym = "B" },
+    { id = "minecraft:mossy_stone_bricks", name = "Mossy Stone Bricks", color = colors.gray, sym = "B" },
+    { id = "minecraft:cracked_stone_bricks", name = "Cracked Stone Bricks", color = colors.gray, sym = "B" },
+    { id = "minecraft:chiseled_stone_bricks", name = "Chiseled Stone Bricks", color = colors.gray, sym = "B" },
+    { id = "minecraft:deepslate", name = "Deepslate", color = colors.gray, sym = "D" },
+    { id = "minecraft:cobbled_deepslate", name = "Cobbled Deepslate", color = colors.gray, sym = "D" },
+    { id = "minecraft:polished_deepslate", name = "Polished Deepslate", color = colors.gray, sym = "D" },
+    { id = "minecraft:deepslate_bricks", name = "Deepslate Bricks", color = colors.gray, sym = "D" },
+    { id = "minecraft:deepslate_tiles", name = "Deepslate Tiles", color = colors.gray, sym = "D" },
+    { id = "minecraft:reinforced_deepslate", name = "Reinforced Deepslate", color = colors.black, sym = "D" },
+    { id = "minecraft:melon", name = "Melon", color = colors.green, sym = "M" },
+    { id = "minecraft:mycelium", name = "Mycelium", color = colors.purple, sym = "M" },
+    { id = "minecraft:nether_bricks", name = "Nether Bricks", color = colors.red, sym = "B" },
+    { id = "minecraft:end_stone", name = "End Stone", color = colors.yellow, sym = "E" },
+    { id = "minecraft:emerald_block", name = "Emerald Block", color = colors.green, sym = "E" },
+    { id = "minecraft:quartz_block", name = "Quartz Block", color = colors.white, sym = "Q" },
+    { id = "minecraft:white_terracotta", name = "White Terracotta", color = colors.white, sym = "T" },
+    { id = "minecraft:orange_terracotta", name = "Orange Terracotta", color = colors.orange, sym = "T" },
+    { id = "minecraft:magenta_terracotta", name = "Magenta Terracotta", color = colors.magenta, sym = "T" },
+    { id = "minecraft:light_blue_terracotta", name = "Light Blue Terracotta", color = colors.lightBlue, sym = "T" },
+    { id = "minecraft:yellow_terracotta", name = "Yellow Terracotta", color = colors.yellow, sym = "T" },
+    { id = "minecraft:lime_terracotta", name = "Lime Terracotta", color = colors.lime, sym = "T" },
+    { id = "minecraft:pink_terracotta", name = "Pink Terracotta", color = colors.pink, sym = "T" },
+    { id = "minecraft:gray_terracotta", name = "Gray Terracotta", color = colors.gray, sym = "T" },
+    { id = "minecraft:light_gray_terracotta", name = "Light Gray Terracotta", color = colors.lightGray, sym = "T" },
+    { id = "minecraft:cyan_terracotta", name = "Cyan Terracotta", color = colors.cyan, sym = "T" },
+    { id = "minecraft:purple_terracotta", name = "Purple Terracotta", color = colors.purple, sym = "T" },
+    { id = "minecraft:blue_terracotta", name = "Blue Terracotta", color = colors.blue, sym = "T" },
+    { id = "minecraft:brown_terracotta", name = "Brown Terracotta", color = colors.brown, sym = "T" },
+    { id = "minecraft:green_terracotta", name = "Green Terracotta", color = colors.green, sym = "T" },
+    { id = "minecraft:red_terracotta", name = "Red Terracotta", color = colors.red, sym = "T" },
+    { id = "minecraft:black_terracotta", name = "Black Terracotta", color = colors.black, sym = "T" },
+    { id = "minecraft:hay_block", name = "Hay Bale", color = colors.yellow, sym = "H" },
+    { id = "minecraft:terracotta", name = "Terracotta", color = colors.orange, sym = "T" },
+    { id = "minecraft:coal_block", name = "Block of Coal", color = colors.black, sym = "C" },
+    { id = "minecraft:packed_ice", name = "Packed Ice", color = colors.lightBlue, sym = "I" },
+    { id = "minecraft:blue_ice", name = "Blue Ice", color = colors.blue, sym = "I" },
+    { id = "minecraft:prismarine", name = "Prismarine", color = colors.cyan, sym = "P" },
+    { id = "minecraft:prismarine_bricks", name = "Prismarine Bricks", color = colors.cyan, sym = "P" },
+    { id = "minecraft:dark_prismarine", name = "Dark Prismarine", color = colors.cyan, sym = "P" },
+    { id = "minecraft:sea_lantern", name = "Sea Lantern", color = colors.white, sym = "L" },
+    { id = "minecraft:red_sandstone", name = "Red Sandstone", color = colors.orange, sym = "S" },
+    { id = "minecraft:magma_block", name = "Magma Block", color = colors.red, sym = "M" },
+    { id = "minecraft:nether_wart_block", name = "Nether Wart Block", color = colors.red, sym = "W" },
+    { id = "minecraft:warped_wart_block", name = "Warped Wart Block", color = colors.cyan, sym = "W" },
+    { id = "minecraft:red_nether_bricks", name = "Red Nether Bricks", color = colors.red, sym = "B" },
+    { id = "minecraft:bone_block", name = "Bone Block", color = colors.white, sym = "B" },
+    { id = "minecraft:shulker_box", name = "Shulker Box", color = colors.purple, sym = "S" },
+    { id = "minecraft:white_concrete", name = "White Concrete", color = colors.white, sym = "C" },
+    { id = "minecraft:orange_concrete", name = "Orange Concrete", color = colors.orange, sym = "C" },
+    { id = "minecraft:magenta_concrete", name = "Magenta Concrete", color = colors.magenta, sym = "C" },
+    { id = "minecraft:light_blue_concrete", name = "Light Blue Concrete", color = colors.lightBlue, sym = "C" },
+    { id = "minecraft:yellow_concrete", name = "Yellow Concrete", color = colors.yellow, sym = "C" },
+    { id = "minecraft:lime_concrete", name = "Lime Concrete", color = colors.lime, sym = "C" },
+    { id = "minecraft:pink_concrete", name = "Pink Concrete", color = colors.pink, sym = "C" },
+    { id = "minecraft:gray_concrete", name = "Gray Concrete", color = colors.gray, sym = "C" },
+    { id = "minecraft:light_gray_concrete", name = "Light Gray Concrete", color = colors.lightGray, sym = "C" },
+    { id = "minecraft:cyan_concrete", name = "Cyan Concrete", color = colors.cyan, sym = "C" },
+    { id = "minecraft:purple_concrete", name = "Purple Concrete", color = colors.purple, sym = "C" },
+    { id = "minecraft:blue_concrete", name = "Blue Concrete", color = colors.blue, sym = "C" },
+    { id = "minecraft:brown_concrete", name = "Brown Concrete", color = colors.brown, sym = "C" },
+    { id = "minecraft:green_concrete", name = "Green Concrete", color = colors.green, sym = "C" },
+    { id = "minecraft:red_concrete", name = "Red Concrete", color = colors.red, sym = "C" },
+    { id = "minecraft:black_concrete", name = "Black Concrete", color = colors.black, sym = "C" },
+    { id = "minecraft:white_concrete_powder", name = "White Concrete Powder", color = colors.white, sym = "P" },
+    { id = "minecraft:orange_concrete_powder", name = "Orange Concrete Powder", color = colors.orange, sym = "P" },
+    { id = "minecraft:magenta_concrete_powder", name = "Magenta Concrete Powder", color = colors.magenta, sym = "P" },
+    { id = "minecraft:light_blue_concrete_powder", name = "Light Blue Concrete Powder", color = colors.lightBlue, sym = "P" },
+    { id = "minecraft:yellow_concrete_powder", name = "Yellow Concrete Powder", color = colors.yellow, sym = "P" },
+    { id = "minecraft:lime_concrete_powder", name = "Lime Concrete Powder", color = colors.lime, sym = "P" },
+    { id = "minecraft:pink_concrete_powder", name = "Pink Concrete Powder", color = colors.pink, sym = "P" },
+    { id = "minecraft:gray_concrete_powder", name = "Gray Concrete Powder", color = colors.gray, sym = "P" },
+    { id = "minecraft:light_gray_concrete_powder", name = "Light Gray Concrete Powder", color = colors.lightGray, sym = "P" },
+    { id = "minecraft:cyan_concrete_powder", name = "Cyan Concrete Powder", color = colors.cyan, sym = "P" },
+    { id = "minecraft:purple_concrete_powder", name = "Purple Concrete Powder", color = colors.purple, sym = "P" },
+    { id = "minecraft:blue_concrete_powder", name = "Blue Concrete Powder", color = colors.blue, sym = "P" },
+    { id = "minecraft:brown_concrete_powder", name = "Brown Concrete Powder", color = colors.brown, sym = "P" },
+    { id = "minecraft:green_concrete_powder", name = "Green Concrete Powder", color = colors.green, sym = "P" },
+    { id = "minecraft:red_concrete_powder", name = "Red Concrete Powder", color = colors.red, sym = "P" },
+    { id = "minecraft:black_concrete_powder", name = "Black Concrete Powder", color = colors.black, sym = "P" },
+    { id = "minecraft:dried_kelp_block", name = "Dried Kelp Block", color = colors.green, sym = "K" },
+    { id = "minecraft:dead_tube_coral_block", name = "Dead Tube Coral Block", color = colors.gray, sym = "C" },
+    { id = "minecraft:dead_brain_coral_block", name = "Dead Brain Coral Block", color = colors.gray, sym = "C" },
+    { id = "minecraft:dead_bubble_coral_block", name = "Dead Bubble Coral Block", color = colors.gray, sym = "C" },
+    { id = "minecraft:dead_fire_coral_block", name = "Dead Fire Coral Block", color = colors.gray, sym = "C" },
+    { id = "minecraft:dead_horn_coral_block", name = "Dead Horn Coral Block", color = colors.gray, sym = "C" },
+    { id = "minecraft:tube_coral_block", name = "Tube Coral Block", color = colors.blue, sym = "C" },
+    { id = "minecraft:brain_coral_block", name = "Brain Coral Block", color = colors.pink, sym = "C" },
+    { id = "minecraft:bubble_coral_block", name = "Bubble Coral Block", color = colors.magenta, sym = "C" },
+    { id = "minecraft:fire_coral_block", name = "Fire Coral Block", color = colors.red, sym = "C" },
+    { id = "minecraft:horn_coral_block", name = "Horn Coral Block", color = colors.yellow, sym = "C" },
+    { id = "minecraft:honey_block", name = "Honey Block", color = colors.orange, sym = "H" },
+    { id = "minecraft:honeycomb_block", name = "Honeycomb Block", color = colors.orange, sym = "H" },
+    { id = "minecraft:netherite_block", name = "Block of Netherite", color = colors.black, sym = "N" },
+    { id = "minecraft:ancient_debris", name = "Ancient Debris", color = colors.brown, sym = "D" },
+    { id = "minecraft:crying_obsidian", name = "Crying Obsidian", color = colors.purple, sym = "O" },
+    { id = "minecraft:blackstone", name = "Blackstone", color = colors.black, sym = "B" },
+    { id = "minecraft:polished_blackstone", name = "Polished Blackstone", color = colors.black, sym = "B" },
+    { id = "minecraft:polished_blackstone_bricks", name = "Polished Blackstone Bricks", color = colors.black, sym = "B" },
+    { id = "minecraft:gilded_blackstone", name = "Gilded Blackstone", color = colors.black, sym = "B" },
+    { id = "minecraft:chiseled_polished_blackstone", name = "Chiseled Polished Blackstone", color = colors.black, sym = "B" },
+    { id = "minecraft:quartz_bricks", name = "Quartz Bricks", color = colors.white, sym = "Q" },
+    { id = "minecraft:amethyst_block", name = "Block of Amethyst", color = colors.purple, sym = "A" },
+    { id = "minecraft:budding_amethyst", name = "Budding Amethyst", color = colors.purple, sym = "A" },
+    { id = "minecraft:tuff", name = "Tuff", color = colors.gray, sym = "T" },
+    { id = "minecraft:calcite", name = "Calcite", color = colors.white, sym = "C" },
+    { id = "minecraft:tinted_glass", name = "Tinted Glass", color = colors.gray, sym = "G" },
+    { id = "minecraft:smooth_basalt", name = "Smooth Basalt", color = colors.gray, sym = "B" },
+    { id = "minecraft:raw_iron_block", name = "Block of Raw Iron", color = colors.brown, sym = "I" },
+    { id = "minecraft:raw_copper_block", name = "Block of Raw Copper", color = colors.orange, sym = "C" },
+    { id = "minecraft:raw_gold_block", name = "Block of Raw Gold", color = colors.yellow, sym = "G" },
+    { id = "minecraft:dripstone_block", name = "Dripstone Block", color = colors.brown, sym = "D" },
+    { id = "minecraft:moss_block", name = "Moss Block", color = colors.green, sym = "M" },
+    { id = "minecraft:mud", name = "Mud", color = colors.brown, sym = "M" },
+    { id = "minecraft:packed_mud", name = "Packed Mud", color = colors.brown, sym = "M" },
+    { id = "minecraft:mud_bricks", name = "Mud Bricks", color = colors.brown, sym = "M" },
+    { id = "minecraft:sculk", name = "Sculk", color = colors.cyan, sym = "S" },
+    { id = "minecraft:sculk_catalyst", name = "Sculk Catalyst", color = colors.cyan, sym = "S" },
+    { id = "minecraft:sculk_shrieker", name = "Sculk Shrieker", color = colors.cyan, sym = "S" },
+    { id = "minecraft:ochre_froglight", name = "Ochre Froglight", color = colors.yellow, sym = "F" },
+    { id = "minecraft:verdant_froglight", name = "Verdant Froglight", color = colors.green, sym = "F" },
+    { id = "minecraft:pearlescent_froglight", name = "Pearlescent Froglight", color = colors.purple, sym = "F" },
+}
+
+return items
 ]===]
 bundled_modules["lib_json"] = [===[
 --[[
@@ -6351,6 +7962,135 @@ end
 return strategy
 
 ]===]
+bundled_modules["lib_strategy_excavate"] = [===[
+--[[
+Strategy generator for excavation (quarry).
+Produces a linear list of steps for the turtle to excavate a hole of given dimensions.
+]]
+
+local strategy = {}
+
+local function normalizePositiveInt(value, default)
+    local numberValue = tonumber(value)
+    if not numberValue or numberValue < 1 then
+        return default
+    end
+    return math.floor(numberValue)
+end
+
+local function pushStep(steps, x, y, z, facing, stepType, data)
+    steps[#steps + 1] = {
+        type = stepType,
+        x = x,
+        y = y,
+        z = z,
+        facing = facing,
+        data = data,
+    }
+end
+
+--- Generate an excavation strategy
+---@param length number Length (z-axis)
+---@param width number Width (x-axis)
+---@param depth number Depth (y-axis, downwards)
+---@return table
+function strategy.generate(length, width, depth)
+    length = normalizePositiveInt(length, 8)
+    width = normalizePositiveInt(width, 8)
+    depth = normalizePositiveInt(depth, 3)
+
+    local steps = {}
+    local x, y, z = 0, 0, 0
+    local facing = 0 -- 0: forward (z+), 1: right (x+), 2: back (z-), 3: left (x-)
+
+    -- We assume turtle starts at (0,0,0) which is the top-left corner of the hole.
+    -- It will excavate x=[0, width-1], z=[0, length-1], y=[0, -depth+1].
+    
+    for d = 0, depth - 1 do
+        local currentY = -d
+        
+        -- Serpentine pattern for the layer
+        -- If d is even: start at (0,0), end at (W-1, L-1) or (0, L-1) depending on W.
+        -- If d is odd: we should probably reverse to minimize travel.
+        
+        -- Actually, standard excavate usually returns to start to dump items?
+        -- My system handles restocking/refueling via state machine interrupts.
+        -- So I just need to generate the path.
+        
+        -- Layer logic:
+        -- Iterate z from 0 to length-1.
+        -- For each z, iterate x.
+        
+        -- To optimize, we alternate x direction every z row.
+        -- And we alternate z direction every layer?
+        
+        -- Let's keep it simple.
+        -- Layer 0: z=0..L-1.
+        --   z=0: x=0..W-1
+        --   z=1: x=W-1..0
+        --   ...
+        
+        -- End of Layer 0 is at z=L-1, x=(depends).
+        -- Layer 1 starts at z=L-1, x=(same).
+        -- So Layer 1 should go z=L-1..0.
+        
+        local zStart, zEnd, zStep
+        if d % 2 == 0 then
+            zStart, zEnd, zStep = 0, length - 1, 1
+        else
+            zStart, zEnd, zStep = length - 1, 0, -1
+        end
+        
+        for z = zStart, zEnd, zStep do
+            local xStart, xEnd, xStep
+            -- Determine x direction based on z and layer parity?
+            -- If d is even (0):
+            --   z=0: x=0..W-1
+            --   z=1: x=W-1..0
+            --   So if z is even, x=0..W-1.
+            
+            -- If d is odd (1):
+            --   We start at z=L-1.
+            --   We want to match the x from previous layer.
+            --   Previous layer ended at z=L-1.
+            --   If (L-1) was even, it ended at W-1.
+            --   If (L-1) was odd, it ended at 0.
+            
+            -- Let's just use currentX to decide.
+            -- But we are generating steps, we don't track currentX easily unless we simulate.
+            -- Let's simulate.
+            
+            -- Wait, I can just use the same logic as tunnel.
+            -- If we are at x=0, go to W-1.
+            -- If we are at x=W-1, go to 0.
+            
+            -- But I need to know where I am at the start of the z-loop.
+            -- At start of d=0, I am at (0,0,0).
+            
+            -- Let's track currentX, currentZ.
+            if d == 0 and z == zStart then
+                x = 0
+            end
+            
+            if x == 0 then
+                xStart, xEnd, xStep = 0, width - 1, 1
+            else
+                xStart, xEnd, xStep = width - 1, 0, -1
+            end
+            
+            for ix = xStart, xEnd, xStep do
+                x = ix
+                pushStep(steps, x, currentY, z, 0, "move")
+            end
+        end
+    end
+
+    return steps
+end
+
+return strategy
+
+]===]
 bundled_modules["lib_strategy_farm"] = [===[
 --[[
 Strategy generator for farms.
@@ -6464,6 +8204,277 @@ function strategy.generate(farmType, width, length)
     end
 
     return schema
+end
+
+return strategy
+
+]===]
+bundled_modules["lib_strategy_tunnel"] = [===[
+--[[
+Strategy generator for tunneling.
+Produces a linear list of steps for the turtle to excavate a tunnel of given dimensions.
+]]
+
+local strategy = {}
+
+local function normalizePositiveInt(value, default)
+    local numberValue = tonumber(value)
+    if not numberValue or numberValue < 1 then
+        return default
+    end
+    return math.floor(numberValue)
+end
+
+local function pushStep(steps, x, y, z, facing, stepType, data)
+    steps[#steps + 1] = {
+        type = stepType,
+        x = x,
+        y = y,
+        z = z,
+        facing = facing,
+        data = data,
+    }
+end
+
+local function forward(x, z, facing)
+    if facing == 0 then
+        z = z + 1
+    elseif facing == 1 then
+        x = x + 1
+    elseif facing == 2 then
+        z = z - 1
+    else
+        x = x - 1
+    end
+    return x, z
+end
+
+local function turnLeft(facing)
+    return (facing + 3) % 4
+end
+
+local function turnRight(facing)
+    return (facing + 1) % 4
+end
+
+--- Generate a tunnel strategy
+---@param length number Length of the tunnel
+---@param width number Width of the tunnel
+---@param height number Height of the tunnel
+---@param torchInterval number Distance between torches
+---@return table
+function strategy.generate(length, width, height, torchInterval)
+    length = normalizePositiveInt(length, 16)
+    width = normalizePositiveInt(width, 1)
+    height = normalizePositiveInt(height, 2)
+    torchInterval = normalizePositiveInt(torchInterval, 6)
+
+    local steps = {}
+    local x, y, z = 0, 0, 0
+    local facing = 0 -- 0: forward (z+), 1: right (x+), 2: back (z-), 3: left (x-)
+
+    -- We assume the turtle starts at bottom-left of the tunnel face, facing into the tunnel.
+    -- Actually, let's assume turtle starts at (0,0,0) and that is the bottom-center or bottom-left?
+    -- Let's assume standard behavior: Turtle is at start of tunnel.
+    -- It will mine forward `length` blocks.
+    -- If width > 1, it needs to strafe or turn.
+    
+    -- Simple implementation: Layer by layer, row by row.
+    -- But for a tunnel, we usually want to move forward, clearing the cross-section.
+    
+    for l = 1, length do
+        -- Clear the cross-section at current depth
+        -- We are at some (x, y) in the cross section.
+        -- Let's say we start at bottom-left (0,0) of the cross section relative to the tunnel axis.
+        
+        -- Actually, simpler: Just iterate x, y, z loops.
+        -- But we want to minimize movement.
+        -- Serpentine pattern for the cross section?
+        
+        -- Let's stick to the `state_mine` logic which expects "move" steps.
+        -- `state_mine` is designed for branch mining where it moves forward and mines neighbors.
+        -- It might not be suitable for clearing a large room.
+        -- `state_mine` supports: move, turn, mine_neighbors, place_torch.
+        -- `mine_neighbors` mines up, down, left, right, front.
+        
+        -- If we use `state_mine`, we are limited to its capabilities.
+        -- Maybe we should use `state_build` logic but with "dig" enabled?
+        -- Or extend `state_mine`?
+        
+        -- `state_mine` logic:
+        -- if step.type == "move" then movement.goTo(dest, {dig=true})
+        
+        -- So if we generate a path that covers every block in the tunnel volume, `movement.goTo` with `dig=true` will clear it.
+        -- We just need to generate the path.
+        
+        -- Let's generate a path that visits every block in the volume (0..width-1, 0..height-1, 1..length)
+        -- Wait, 1..length because 0 is start?
+        -- Let's say turtle starts at 0,0,0.
+        -- It needs to clear 0,0,1 to width-1, height-1, length.
+        
+        -- Actually, let's just do a simple serpentine.
+        
+        -- Current pos
+        -- x, y, z are relative to start.
+        
+        -- We are at (x,y,z). We want to clear the block at (x,y,z) if it's not 0,0,0?
+        -- No, `goTo` moves TO the block.
+        
+        -- Let's iterate length first (depth), then width/height?
+        -- No, usually you want to clear the face then move forward.
+        -- But `goTo` is absolute coords.
+        
+        -- Let's do:
+        -- For each slice z = 1 to length:
+        --   For each y = 0 to height-1:
+        --     For each x = 0 to width-1:
+        --       visit(x, y, z)
+        
+        -- Optimization: Serpentine x and y.
+    end
+    
+    -- Re-thinking: `state_mine` uses `localToWorld` which interprets x,y,z relative to turtle start.
+    -- So we just need to generate a list of coordinates to visit.
+    
+    local currentX, currentY, currentZ = 0, 0, 0
+    
+    for d = 1, length do
+        -- Move forward to next slice
+        -- We are at z = d-1. We want to clear z = d.
+        -- But we also need to clear x=0..width-1, y=0..height-1 at z=d.
+        
+        -- Let's assume we are at (currentX, currentY, d-1).
+        -- We move to (currentX, currentY, d).
+        
+        -- Serpentine logic for the face
+        -- We are at some x,y.
+        -- We want to cover all x in [0, width-1] and y in [0, height-1].
+        
+        -- If we are just moving forward, we are carving a 1x1 tunnel.
+        -- If width/height > 1, we need to visit others.
+        
+        -- Let's generate points.
+        local slicePoints = {}
+        for y = 0, height - 1 do
+            for x = 0, width - 1 do
+                table.insert(slicePoints, {x=x, y=y})
+            end
+        end
+        
+        -- Sort slicePoints to be nearest neighbor or serpentine
+        -- Simple serpentine:
+        -- If y is even, x goes 0 -> width-1
+        -- If y is odd, x goes width-1 -> 0
+        -- But we also need to minimize y movement.
+        
+        -- Actually, let's just generate the path directly.
+        
+        -- We are at z=d.
+        -- We iterate y from 0 to height-1.
+        -- If y is even: x from 0 to width-1
+        -- If y is odd: x from width-1 to 0
+        
+        -- But wait, between slices, we want to connect the end of slice d to start of slice d+1.
+        -- End of slice d is (endX, endY, d).
+        -- Start of slice d+1 should be (endX, endY, d+1).
+        -- So we should reverse the traversal order for the next slice?
+        -- Or just continue?
+        
+        -- Let's try to keep it simple.
+        -- Slice 1:
+        --   y=0: x=0->W
+        --   y=1: x=W->0
+        --   ...
+        --   End at (LastX, LastY, 1)
+        
+        -- Slice 2:
+        --   Start at (LastX, LastY, 2)
+        --   We should traverse in reverse of Slice 1 to minimize movement?
+        --   Or just continue the pattern?
+        
+        -- Let's just do standard serpentine for every slice, but reverse the whole slice order if d is even?
+        
+        local yStart, yEnd, yStep
+        if d % 2 == 1 then
+            yStart, yEnd, yStep = 0, height - 1, 1
+        else
+            yStart, yEnd, yStep = height - 1, 0, -1
+        end
+        
+        for y = yStart, yEnd, yStep do
+            local xStart, xEnd, xStep
+            -- If we are on an "even" row relative to the start of this slice...
+            -- Let's just say: if y is even, go right. If y is odd, go left.
+            -- But we need to match the previous position.
+            
+            -- If we came from z-1, we are at (currentX, currentY, d-1).
+            -- We move to (currentX, currentY, d).
+            -- So we should start this slice at currentX, currentY.
+            
+            -- This implies we shouldn't hardcode loops, but rather "fill" the slice starting from current pos.
+            -- But that's pathfinding.
+            
+            -- Let's stick to a fixed pattern that aligns.
+            -- If width=1, height=2.
+            -- d=1: (0,0,1) -> (0,1,1). End at (0,1,1).
+            -- d=2: (0,1,2) -> (0,0,2). End at (0,0,2).
+            -- d=3: (0,0,3) -> (0,1,3).
+            -- This works perfectly.
+            
+            -- So:
+            -- If d is odd: y goes 0 -> height-1.
+            -- If d is even: y goes height-1 -> 0.
+            
+            -- Inside y loop:
+            -- We need to decide x direction.
+            -- If y is even (0, 2...): x goes 0 -> width-1?
+            -- Let's trace d=1 (odd). y=0. x=0->W. End x=W-1.
+            -- y=1. We are at x=W-1. So x should go W-1 -> 0.
+            -- So if y is odd: x goes W-1 -> 0.
+            
+            -- Now d=2 (even). Start y=height-1.
+            -- If height=2. Start y=1.
+            -- We ended d=1 at (0, 1, 1).
+            -- So we start d=2 at (0, 1, 2).
+            -- y=1 is odd. So x goes W-1 -> 0?
+            -- Wait, we are at x=0.
+            -- So if y is odd, we should go 0 -> W-1?
+            -- This depends on where we ended.
+            
+            -- Let's generalize.
+            -- We are at (currentX, currentY, d).
+            -- We want to visit all x in row y.
+            -- If currentX is 0, go to W-1.
+            -- If currentX is W-1, go to 0.
+            
+            if currentX == 0 then
+                xStart, xEnd, xStep = 0, width - 1, 1
+            else
+                xStart, xEnd, xStep = width - 1, 0, -1
+            end
+            
+            for x = xStart, xEnd, xStep do
+                -- We are visiting (x, y, d)
+                -- But wait, we need to actually MOVE there.
+                -- The loop generates the target coordinates.
+                
+                -- If this is the very first point (0,0,1), we are at (0,0,0).
+                -- We just push the step.
+                
+                pushStep(steps, x, y, d, 0, "move")
+                currentX, currentY, currentZ = x, y, d
+                
+                -- Place torch?
+                -- Only on the floor (y=0) and maybe centered x?
+                -- And at interval.
+                if y == 0 and x == math.floor((width-1)/2) and d % torchInterval == 0 then
+                     pushStep(steps, x, y, d, 0, "place_torch")
+                end
+            end
+        end
+    end
+
+    return steps
 end
 
 return strategy
@@ -8217,6 +10228,8 @@ local parser = require("lib_parser")
 local orientation = require("lib_orientation")
 local logger = require("lib_logger")
 local strategyBranchMine = require("lib_strategy_branchmine")
+local strategyTunnel = require("lib_strategy_tunnel")
+local strategyExcavate = require("lib_strategy_excavate")
 local strategyFarm = require("lib_strategy_farm")
 local ui = require("lib_ui")
 
@@ -8343,6 +10356,35 @@ local function INITIALIZE(ctx)
         ctx.pointer = 1
         
         logger.log(ctx, "info", string.format("Mining Plan: %d steps.", #ctx.strategy))
+        ctx.nextState = "MINE"
+        return "CHECK_REQUIREMENTS"
+    end
+
+    if ctx.config.mode == "tunnel" then
+        logger.log(ctx, "info", "Generating tunnel strategy...")
+        local length = tonumber(ctx.config.length) or 16
+        local width = tonumber(ctx.config.width) or 1
+        local height = tonumber(ctx.config.height) or 2
+        local torchInterval = tonumber(ctx.config.torchInterval) or 6
+        
+        ctx.strategy = strategyTunnel.generate(length, width, height, torchInterval)
+        ctx.pointer = 1
+        
+        logger.log(ctx, "info", string.format("Tunnel Plan: %d steps.", #ctx.strategy))
+        ctx.nextState = "MINE"
+        return "CHECK_REQUIREMENTS"
+    end
+
+    if ctx.config.mode == "excavate" then
+        logger.log(ctx, "info", "Generating excavation strategy...")
+        local length = tonumber(ctx.config.length) or 8
+        local width = tonumber(ctx.config.width) or 8
+        local depth = tonumber(ctx.config.depth) or 3
+        
+        ctx.strategy = strategyExcavate.generate(length, width, depth)
+        ctx.pointer = 1
+        
+        logger.log(ctx, "info", string.format("Excavation Plan: %d steps.", #ctx.strategy))
         ctx.nextState = "MINE"
         return "CHECK_REQUIREMENTS"
     end
@@ -8770,6 +10812,8 @@ Graphical launcher for the factory agent.
 --]]
 
 local ui = require("lib_ui")
+local designer = require("lib_designer")
+local games = require("lib_games")
 
 -- Hack to load factory without running it immediately
 _G.__FACTORY_EMBED__ = true
@@ -8808,14 +10852,63 @@ local function runMining(form)
 end
 
 local function runTunnel()
+    local length = 16
+    local width = 1
+    local height = 2
+    local torch = 6
+    
+    local form = ui.Form("Tunnel Configuration")
+    form:addInput("length", "Length", tostring(length))
+    form:addInput("width", "Width", tostring(width))
+    form:addInput("height", "Height", tostring(height))
+    form:addInput("torch", "Torch Interval", tostring(torch))
+    
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+    
+    for _, el in ipairs(form.elements) do
+        if el.id == "length" then length = tonumber(el.value) or 16 end
+        if el.id == "width" then width = tonumber(el.value) or 1 end
+        if el.id == "height" then height = tonumber(el.value) or 2 end
+        if el.id == "torch" then torch = tonumber(el.value) or 6 end
+    end
+    
     ui.clear()
-    print("Tunneling not implemented yet.")
+    print("Starting Tunnel Operation...")
+    print(string.format("L: %d, W: %d, H: %d", length, width, height))
+    sleep(1)
+    
+    factory.run({ "tunnel", "--length", tostring(length), "--width", tostring(width), "--height", tostring(height), "--torch-interval", tostring(torch) })
+    
     return pauseAndReturn("stay")
 end
 
 local function runExcavate()
+    local length = 8
+    local width = 8
+    local depth = 3
+    
+    local form = ui.Form("Excavation Configuration")
+    form:addInput("length", "Length", tostring(length))
+    form:addInput("width", "Width", tostring(width))
+    form:addInput("depth", "Depth", tostring(depth))
+    
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+    
+    for _, el in ipairs(form.elements) do
+        if el.id == "length" then length = tonumber(el.value) or 8 end
+        if el.id == "width" then width = tonumber(el.value) or 8 end
+        if el.id == "depth" then depth = tonumber(el.value) or 3 end
+    end
+    
     ui.clear()
-    print("Excavation not implemented yet.")
+    print("Starting Excavation Operation...")
+    print(string.format("L: %d, W: %d, D: %d", length, width, depth))
+    sleep(1)
+    
+    factory.run({ "excavate", "--length", tostring(length), "--width", tostring(width), "--depth", tostring(depth) })
+    
     return pauseAndReturn("stay")
 end
 
@@ -8828,8 +10921,28 @@ local function runTreeFarm()
 end
 
 local function runPotatoFarm()
+    local width = 9
+    local length = 9
+    
+    local form = ui.Form("Potato Farm Configuration")
+    form:addInput("width", "Width", tostring(width))
+    form:addInput("length", "Length", tostring(length))
+    
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+    
+    for _, el in ipairs(form.elements) do
+        if el.id == "width" then width = tonumber(el.value) or 9 end
+        if el.id == "length" then length = tonumber(el.value) or 9 end
+    end
+    
     ui.clear()
-    print("Potato Farm not implemented yet.")
+    print("Starting Potato Farm Build...")
+    print(string.format("W: %d, L: %d", width, length))
+    sleep(1)
+    
+    factory.run({ "farm", "--farm-type", "potato", "--width", tostring(width), "--length", tostring(length) })
+    
     return pauseAndReturn("stay")
 end
 
@@ -8843,14 +10956,60 @@ local function runBuild(schemaFile)
 end
 
 local function runImportSchema()
+    local url = ""
+    local filename = "schema.json"
+    
+    local form = ui.Form("Import Schema")
+    form:addInput("url", "URL/Code", url)
+    form:addInput("filename", "Save As", filename)
+    
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+    
+    for _, el in ipairs(form.elements) do
+        if el.id == "url" then url = el.value end
+        if el.id == "filename" then filename = el.value end
+    end
+    
+    if url == "" then
+        print("URL is required.")
+        return pauseAndReturn("stay")
+    end
+    
     ui.clear()
-    print("Import Schema not implemented yet.")
+    print("Downloading " .. url .. "...")
+    
+    if not url:find("http") then
+        -- Assume pastebin code
+        url = "https://pastebin.com/raw/" .. url
+    end
+    
+    if not http then
+        print("HTTP API not enabled.")
+        return pauseAndReturn("stay")
+    end
+    
+    local response = http.get(url)
+    if not response then
+        print("Failed to download.")
+        return pauseAndReturn("stay")
+    end
+    
+    local content = response.readAll()
+    response.close()
+    
+    local f = fs.open(filename, "w")
+    f.write(content)
+    f.close()
+    
+    print("Saved to " .. filename)
+    
     return pauseAndReturn("stay")
 end
 
 local function runSchemaDesigner()
     ui.clear()
-    print("Schema Designer not implemented yet.")
+    designer.run()
     return pauseAndReturn("stay")
 end
 
@@ -8940,12 +11099,25 @@ local function showSystemMenu()
     end
 end
 
+local function showGamesMenu()
+    while true do
+        local res = ui.runMenu("Games", {
+            { text = "Solitaire", callback = games.solitaire },
+            { text = "Minesweeper", callback = games.minesweeper },
+            { text = "Euchre", callback = games.euchre },
+            { text = "Back", callback = function() return "back" end }
+        })
+        if res == "back" then return end
+    end
+end
+
 local function showMainMenu()
     while true do
         local res = ui.runMenu("TurtleOS v2.1", {
             { text = "MINE >", callback = showMineMenu },
             { text = "FARM >", callback = showFarmMenu },
             { text = "BUILD >", callback = showBuildMenu },
+            { text = "GAMES >", callback = showGamesMenu },
             { text = "SYSTEM >", callback = showSystemMenu },
             { text = "Exit", callback = function() return "exit" end }
         })

@@ -7,6 +7,8 @@ local parser = require("lib_parser")
 local orientation = require("lib_orientation")
 local logger = require("lib_logger")
 local strategyBranchMine = require("lib_strategy_branchmine")
+local strategyTunnel = require("lib_strategy_tunnel")
+local strategyExcavate = require("lib_strategy_excavate")
 local strategyFarm = require("lib_strategy_farm")
 local ui = require("lib_ui")
 
@@ -133,6 +135,35 @@ local function INITIALIZE(ctx)
         ctx.pointer = 1
         
         logger.log(ctx, "info", string.format("Mining Plan: %d steps.", #ctx.strategy))
+        ctx.nextState = "MINE"
+        return "CHECK_REQUIREMENTS"
+    end
+
+    if ctx.config.mode == "tunnel" then
+        logger.log(ctx, "info", "Generating tunnel strategy...")
+        local length = tonumber(ctx.config.length) or 16
+        local width = tonumber(ctx.config.width) or 1
+        local height = tonumber(ctx.config.height) or 2
+        local torchInterval = tonumber(ctx.config.torchInterval) or 6
+        
+        ctx.strategy = strategyTunnel.generate(length, width, height, torchInterval)
+        ctx.pointer = 1
+        
+        logger.log(ctx, "info", string.format("Tunnel Plan: %d steps.", #ctx.strategy))
+        ctx.nextState = "MINE"
+        return "CHECK_REQUIREMENTS"
+    end
+
+    if ctx.config.mode == "excavate" then
+        logger.log(ctx, "info", "Generating excavation strategy...")
+        local length = tonumber(ctx.config.length) or 8
+        local width = tonumber(ctx.config.width) or 8
+        local depth = tonumber(ctx.config.depth) or 3
+        
+        ctx.strategy = strategyExcavate.generate(length, width, depth)
+        ctx.pointer = 1
+        
+        logger.log(ctx, "info", string.format("Excavation Plan: %d steps.", #ctx.strategy))
         ctx.nextState = "MINE"
         return "CHECK_REQUIREMENTS"
     end

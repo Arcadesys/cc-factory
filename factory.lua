@@ -64,6 +64,12 @@ local function run(args)
             ctx.config.verbose = true
         elseif value == "mine" then
             ctx.config.mode = "mine"
+        elseif value == "tunnel" then
+            ctx.config.mode = "tunnel"
+        elseif value == "excavate" then
+            ctx.config.mode = "excavate"
+        elseif value == "treefarm" then
+            ctx.state = "TREEFARM"
         elseif value == "farm" then
             ctx.config.mode = "farm"
         elseif value == "--farm-type" then
@@ -72,6 +78,12 @@ local function run(args)
         elseif value == "--width" then
             index = index + 1
             ctx.config.width = tonumber(args[index])
+        elseif value == "--height" then
+            index = index + 1
+            ctx.config.height = tonumber(args[index])
+        elseif value == "--depth" then
+            index = index + 1
+            ctx.config.depth = tonumber(args[index])
         elseif value == "--length" then
             index = index + 1
             ctx.config.length = tonumber(args[index])
