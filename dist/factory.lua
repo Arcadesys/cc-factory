@@ -404,6 +404,8 @@ end
 
 -- --- Rendering ---
 
+local drawSearch
+
 local function drawMenu()
     if not state.menuOpen then return end
     
@@ -511,13 +513,13 @@ local function drawUI()
     
     local editLabel = state.paletteEditMode and "[EDITING]" or "[Edit]"
     if state.paletteEditMode then term.setTextColor(colors.red) end
-    term.write("Palette " .. editLabel)
+    term.write("Pal " .. editLabel)
     
     -- Search Button
-    term.setCursorPos(palX + 16, 2)
+    term.setCursorPos(palX + 14, 2)
     term.setBackgroundColor(COLORS.btn_inactive)
     term.setTextColor(COLORS.btn_text)
-    term.write(" S ")
+    term.write("Find")
     
     for i, mat in ipairs(state.palette) do
         term.setCursorPos(palX, 3 + i)
@@ -538,7 +540,8 @@ local function drawUI()
         
         term.setBackgroundColor(COLORS.bg)
         term.setTextColor(COLORS.text)
-        term.write(" " .. mat.id:match(":(.+)"))
+        local name = mat.id:match(":(.+)") or mat.id
+        term.write(" " .. name)
     end
     
     -- Status Bar (Bottom)
@@ -550,7 +553,7 @@ local function drawUI()
     
     -- Instructions
     term.setCursorPos(1, h-1)
-    term.write("S:Save L:Load R:Resize C:Clear Q:Quit PgUp/Dn:Layer")
+    term.write("S:Save L:Load F:Find R:Resize C:Clear Q:Quit PgUp/Dn:Layer")
     
     drawMenu()
     drawInventory()
@@ -758,7 +761,7 @@ local function updateSearchResults()
     state.searchScroll = 0
 end
 
-local function drawSearch()
+drawSearch = function()
     if not state.searchOpen then return end
     
     local w, h = term.getSize()
@@ -913,13 +916,13 @@ function designer.run()
             if not handled and mx >= palX and mx <= palX + 18 then -- Expanded for Search button
                 if my == 2 then
                     -- Check Edit vs Search
-                    if mx >= palX + 16 and mx <= palX + 18 then
+                    if mx >= palX + 14 and mx <= palX + 17 then
                         state.searchOpen = not state.searchOpen
                         if state.searchOpen then 
                             state.searchQuery = "" 
                             updateSearchResults()
                         end
-                    elseif mx <= palX + 15 then
+                    elseif mx <= palX + 13 then
                         state.paletteEditMode = not state.paletteEditMode
                     end
                     handled = true
@@ -1027,6 +1030,13 @@ function designer.run()
                 end
             else
                 if key == keys.q then state.running = false end
+                if key == keys.f then 
+                    state.searchOpen = not state.searchOpen 
+                    if state.searchOpen then 
+                        state.searchQuery = "" 
+                        updateSearchResults()
+                    end
+                end
                 if key == keys.s then saveSchema() end
                 if key == keys.r then resizeCanvas() end
                 if key == keys.c then state.data = {} end -- Clear all
