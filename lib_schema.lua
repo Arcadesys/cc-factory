@@ -6,18 +6,19 @@ Provides helpers for working with build schemas.
 ---@diagnostic disable: undefined-global
 
 local schema_utils = {}
+local table_utils = require("lib_table")
+
+local function copyTable(tbl)
+    if type(tbl) ~= "table" then return {} end
+    return table_utils.shallowCopy(tbl)
+end
 
 function schema_utils.pushMaterialCount(counts, material)
     counts[material] = (counts[material] or 0) + 1
 end
 
-local table_utils = require("lib_table")
-
 function schema_utils.cloneMeta(meta)
-    if type(meta) ~= "table" then
-        return {}
-    end
-    return table_utils.shallowCopy(meta)
+    return copyTable(meta)
 end
 
 function schema_utils.newBounds()
@@ -142,6 +143,43 @@ function schema_utils.fetchSchemaEntry(schema, pos)
         return nil, "empty"
     end
     return block
+end
+
+function schema_utils.canonicalToGrid(schema, opts)
+    opts = opts or {}
+    local grid = {}
+    if type(schema) ~= "table" then
+        return grid
+    end
+    for x, xColumn in pairs(schema) do
+        if type(xColumn) == "table" then
+            for y, yColumn in pairs(xColumn) do
+                if type(yColumn) == "table" then
+                    for z, block in pairs(yColumn) do
+                        if block and type(block) == "table" then
+                            local material = block.material
+                            if material and material ~= "" then
+                                local gx = tostring(x)
+                                local gy = tostring(y)
+                                local gz = tostring(z)
+                                grid[gx] = grid[gx] or {}
+                                grid[gx][gy] = grid[gx][gy] or {}
+                                grid[gx][gy][gz] = {
+                                    material = material,
+                                    meta = copyTable(block.meta),
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return grid
+end
+
+function schema_utils.canonicalToVoxelDefinition(schema, opts)
+    return { grid = schema_utils.canonicalToGrid(schema, opts) }
 end
 
 function schema_utils.printMaterials(io, info)
