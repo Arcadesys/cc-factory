@@ -6,6 +6,9 @@ Graphical launcher for the factory agent.
 local ui = require("lib_ui")
 local designer = require("lib_designer")
 local games = require("lib_games")
+local parser = require("lib_parser")
+local json = require("lib_json")
+local schema_utils = require("lib_schema")
 
 -- Hack to load factory without running it immediately
 _G.__FACTORY_EMBED__ = true
@@ -147,6 +150,60 @@ local function runBuild(schemaFile)
     return pauseAndReturn("stay")
 end
 
+local function runEditSchema(schemaFile)
+    ui.clear()
+    print("Validating Schema...")
+    print("Schema: " .. schemaFile)
+
+    local ctx = {}
+    local ok, schema, metadata = parser.parseFile(ctx, schemaFile)
+    if not ok then
+        print("Failed to parse schema: " .. tostring(schema))
+        return pauseAndReturn("stay")
+    end
+
+    local editedSchema, exportInfo = designer.run({
+        schema = schema,
+        metadata = metadata,
+        returnSchema = true,
+    })
+
+    if not editedSchema then
+        local errMsg = exportInfo or "Editor closed without returning a schema."
+        print(tostring(errMsg))
+        return pauseAndReturn("stay")
+    end
+
+    print(string.format("Editor returned %d blocks.", (exportInfo and exportInfo.totalBlocks) or 0))
+
+    local defaultName = schemaFile
+    local form = ui.Form("Save Edited Schema")
+    form:addInput("filename", "Filename", defaultName)
+    local result = form:run()
+    if result == "cancel" then return "stay" end
+
+    local filename = defaultName
+    for _, el in ipairs(form.elements) do
+        if el.id == "filename" then filename = el.value end
+    end
+    if filename == "" then filename = defaultName end
+    if not filename:match("%.json$") then filename = filename .. ".json" end
+
+    if fs.exists(filename) then
+        local backup = filename .. ".bak"
+        fs.copy(filename, backup)
+        print("Existing file backed up to " .. backup)
+    end
+
+    local definition = schema_utils.canonicalToVoxelDefinition(editedSchema)
+    local f = fs.open(filename, "w")
+    f.write(json.encode(definition))
+    f.close()
+
+    print("Saved edited schema to " .. filename)
+    return pauseAndReturn("stay")
+end
+
 local function runImportSchema()
     local url = ""
     local filename = "schema.json"
@@ -237,6 +294,25 @@ local function showBuildMenu()
     end
 end
 
+local function showEditMenu()
+    while true do
+        local schemas = getSchemaFiles()
+        local items = {}
+
+        for _, schema in ipairs(schemas) do
+            table.insert(items, {
+                text = "Edit " .. schema,
+                callback = function() return runEditSchema(schema) end
+            })
+        end
+
+        table.insert(items, { text = "Back", callback = function() return "back" end })
+
+        local res = ui.runMenu("Validate & Edit Schema", items)
+        if res == "back" then return end
+    end
+end
+
 local function showMiningWizard()
     local form = {
         title = "Mining Wizard",
@@ -284,6 +360,7 @@ local function showSystemMenu()
     while true do
         local res = ui.runMenu("System Tools", {
             { text = "Import Schema", callback = runImportSchema },
+            { text = "Validate & Edit Schema", callback = showEditMenu },
             { text = "Schema Designer", callback = runSchemaDesigner },
             { text = "Back", callback = function() return "back" end }
         })
