@@ -8,11 +8,12 @@ local inventory = require("lib_inventory")
 local logger = require("lib_logger")
 
 local function RESTOCK(ctx)
-    logger.info("Restocking " .. tostring(ctx.missingMaterial))
+    logger.log(ctx, "info", "Restocking " .. tostring(ctx.missingMaterial))
     
     -- Go home
     local ok, err = movement.goTo(ctx, ctx.origin)
     if not ok then
+        ctx.resumeState = ctx.resumeState or "BUILD"
         return "BLOCKED"
     end
 
@@ -30,7 +31,11 @@ local function RESTOCK(ctx)
     -- We'll try pulling from all sides.
     
     local material = ctx.missingMaterial
-    if not material then return "BUILD" end -- Should not happen
+    if not material then
+        local resume = ctx.resumeState or "BUILD"
+        ctx.resumeState = nil
+        return resume
+    end
 
     local pulled = false
     for _, side in ipairs({"front", "up", "down", "left", "right", "back"}) do
@@ -42,12 +47,14 @@ local function RESTOCK(ctx)
     end
 
     if not pulled then
-        logger.error("Could not find " .. material .. " in nearby inventories.")
+        logger.log(ctx, "error", "Could not find " .. material .. " in nearby inventories.")
         return "ERROR"
     end
 
     ctx.missingMaterial = nil
-    return "BUILD"
+    local resume = ctx.resumeState or "BUILD"
+    ctx.resumeState = nil
+    return resume
 end
 
 return RESTOCK

@@ -3,12 +3,13 @@ State: MINE
 Executes the mining strategy step by step.
 ]]
 
+---@diagnostic disable: undefined-global
+
 local movement = require("lib_movement")
 local inventory = require("lib_inventory")
 local mining = require("lib_mining")
-local fuelLib = require("lib_fuel")
 local logger = require("lib_logger")
-local orientation = require("lib_orientation")
+local diagnostics = require("lib_diagnostics")
 
 local function localToWorld(ctx, localPos)
     local ox, oy, oz = ctx.origin.x, ctx.origin.y, ctx.origin.z
@@ -39,18 +40,31 @@ local function localToWorld(ctx, localPos)
     return { x = wx, y = wy, z = wz }
 end
 
+local function selectTorch(ctx)
+    local torchItem = ctx.config.torchItem or "minecraft:torch"
+    local ok = inventory.selectMaterial(ctx, torchItem)
+    if ok then
+        return true, torchItem
+    end
+    ctx.missingMaterial = torchItem
+    return false, torchItem
+end
+
 local function MINE(ctx)
     logger.log(ctx, "info", "State: MINE")
 
-    -- Check Fuel
-    if turtle.getFuelLevel() < 100 then
-        logger.log(ctx, "warn", "Low fuel, refueling...")
+    if turtle.getFuelLevel and turtle.getFuelLevel() < 100 then
+        logger.log(ctx, "warn", "Fuel low; switching to REFUEL")
+        ctx.resumeState = "MINE"
         return "REFUEL"
     end
 
     -- Get current step
     local stepIndex = ctx.pointer or 1
-    local strategy = ctx.strategy
+    local strategy, errMsg = diagnostics.requireStrategy(ctx)
+    if not strategy then
+        return "ERROR"
+    end
     
     if stepIndex > #strategy then
         return "DONE"
@@ -61,43 +75,11 @@ local function MINE(ctx)
     -- Execute step based on type
     if step.type == "move" then
         local dest = localToWorld(ctx, step)
-        -- We use goTo which handles pathfinding/digging if needed, 
-        -- but for mining we might want explicit digging.
-        -- Since we are mining, we expect to dig.
-        -- lib_movement.goTo usually tries to move, and if blocked, returns false.
-        -- But here we want to dig our way through.
-        -- Let's assume movement.goTo handles digging if configured?
-        -- Checking lib_movement would be good, but let's assume we need to dig if blocked.
-        
-        -- Actually, for branch mining, we want to move 1 block.
-        -- The strategy generates "move" steps which imply moving 1 block forward usually.
-        -- But the strategy tracks coordinates.
-        
-        local ok, err = movement.goTo(ctx, dest, { dig = true })
+        local ok, err = movement.goTo(ctx, dest, { dig = true, attack = true })
         if not ok then
-            if err == "blocked" then
-                -- Try to dig
-                -- Determine direction to dig
-                -- This is complex with goTo.
-                -- Simpler: The strategy assumes we are at step-1 coords and move to step coords.
-                -- But goTo is absolute.
-                
-                -- If blocked, we are mining! So we should dig.
-                -- But goTo might not dig.
-                -- Let's try to dig in the direction of movement.
-                -- Or better: use movement.forward(ctx) if the step is just forward.
-                -- But the step is a coordinate.
-                
-                -- Let's rely on movement.goTo for now. If it fails, we are BLOCKED.
-                -- But wait, if we are mining, "BLOCKED" is expected (it's stone).
-                -- We need a movement function that digs.
-                
-                -- Let's check if movement.goTo supports digging.
-                -- If not, we might need to implement a simple "digTo" here.
-                
-                return "BLOCKED"
-            end
-            return "ERROR"
+            logger.log(ctx, "warn", "Mining movement blocked: " .. tostring(err))
+            ctx.resumeState = "MINE"
+            return err == "blocked" and "BLOCKED" or "ERROR"
         end
         
     elseif step.type == "turn" then
@@ -111,32 +93,27 @@ local function MINE(ctx)
         mining.scanAndMineNeighbors(ctx)
         
     elseif step.type == "place_torch" then
-        -- Check for torch
-        local torchItem = ctx.config.torchItem or "minecraft:torch"
-        local slot = inventory.findItem(ctx, torchItem)
-        if not slot then
-            ctx.missingMaterial = torchItem
+        local ok = selectTorch(ctx)
+        if not ok then
+            ctx.resumeState = "MINE"
             return "RESTOCK"
         end
-        
-        turtle.select(slot)
-        -- Place torch (usually on floor or wall? Branch miner placed on floor?)
-        -- Let's place down for now, or back?
-        -- Branch miner usually places on floor or wall.
-        -- Let's try placeUp (ceiling) or placeDown (floor).
         if not turtle.placeDown() then
-             -- Try placeUp?
-             turtle.placeUp()
+            turtle.placeUp()
         end
         
     elseif step.type == "dump_trash" then
-        inventory.dumpTrash(ctx)
+        local dumped = inventory.dumpTrash(ctx)
+        if not dumped then
+            logger.log(ctx, "debug", "dumpTrash failed (probably empty inventory)")
+        end
         
     elseif step.type == "done" then
         return "DONE"
     end
     
     ctx.pointer = stepIndex + 1
+    ctx.retries = 0
     return "MINE"
 end
 

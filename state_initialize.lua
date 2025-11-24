@@ -6,6 +6,9 @@ Loads schema, parses it, and computes the build strategy.
 local parser = require("lib_parser")
 local orientation = require("lib_orientation")
 local logger = require("lib_logger")
+local strategyBranchMine = require("lib_strategy_branchmine")
+local strategyFarm = require("lib_strategy_farm")
+local ui = require("lib_ui")
 
 local function getBlock(schema, x, y, z)
     local xLayer = schema[x] or schema[tostring(x)]
@@ -117,11 +120,10 @@ local function buildOrder(schema, info, opts)
 end
 
 local function INITIALIZE(ctx)
-    logger.info("Initializing...")
+    logger.log(ctx, "info", "Initializing...")
     
     if ctx.config.mode == "mine" then
-        logger.info("Generating mining strategy...")
-        local strategyBranchMine = require("lib_strategy_branchmine")
+        logger.log(ctx, "info", "Generating mining strategy...")
         local length = tonumber(ctx.config.length) or 60
         local branchInterval = tonumber(ctx.config.branchInterval) or 3
         local branchLength = tonumber(ctx.config.branchLength) or 16
@@ -130,8 +132,69 @@ local function INITIALIZE(ctx)
         ctx.strategy = strategyBranchMine.generate(length, branchInterval, branchLength, torchInterval)
         ctx.pointer = 1
         
-        logger.info(string.format("Mining Plan: %d steps.", #ctx.strategy))
-        return "MINE"
+        logger.log(ctx, "info", string.format("Mining Plan: %d steps.", #ctx.strategy))
+        ctx.nextState = "MINE"
+        return "CHECK_REQUIREMENTS"
+    end
+
+    if ctx.config.mode == "farm" then
+        logger.log(ctx, "info", "Generating farm strategy...")
+        local farmType = ctx.config.farmType or "tree"
+        local width = tonumber(ctx.config.width) or 9
+        local length = tonumber(ctx.config.length) or 9
+        
+        local schema = strategyFarm.generate(farmType, width, length)
+        
+        -- Preview
+        ui.clear()
+        ui.drawPreview(schema, 2, 2, 30, 15)
+        term.setCursorPos(1, 18)
+        print("Previewing " .. farmType .. " farm.")
+        print("Press Enter to confirm, 'q' to quit.")
+        local input = read()
+        if input == "q" or input == "Q" then
+            return "DONE"
+        end
+        
+        -- Normalize schema for buildOrder
+        -- We need to calculate bounds manually since we don't have parser info
+        local minX, maxX, minZ, maxZ = 9999, -9999, 9999, -9999
+        local minY, maxY = 0, 1 -- Assuming 2 layers for now
+        
+        for sx, row in pairs(schema) do
+            local nx = tonumber(sx)
+            if nx < minX then minX = nx end
+            if nx > maxX then maxX = nx end
+            for sy, col in pairs(row) do
+                for sz, block in pairs(col) do
+                    local nz = tonumber(sz)
+                    if nz < minZ then minZ = nz end
+                    if nz > maxZ then maxZ = nz end
+                end
+            end
+        end
+        
+        ctx.schema = schema
+        ctx.schemaInfo = {
+            bounds = {
+                min = { x = minX, y = minY, z = minZ },
+                max = { x = maxX, y = maxY, z = maxZ }
+            }
+        }
+        
+        logger.log(ctx, "info", "Computing build strategy...")
+        local order, boundsOrErr = buildOrder(ctx.schema, ctx.schemaInfo, ctx.config)
+        if not order then
+            ctx.lastError = "Failed to compute build order: " .. tostring(boundsOrErr)
+            return "ERROR"
+        end
+
+        ctx.strategy = order
+        ctx.pointer = 1
+        
+        logger.log(ctx, "info", string.format("Plan: %d steps.", #order))
+        ctx.nextState = "BUILD"
+        return "CHECK_REQUIREMENTS"
     end
     
     if not ctx.config.schemaPath then
@@ -139,7 +202,7 @@ local function INITIALIZE(ctx)
         return "ERROR"
     end
 
-    logger.info("Loading schema: " .. ctx.config.schemaPath)
+    logger.log(ctx, "info", "Loading schema: " .. ctx.config.schemaPath)
     local ok, schemaOrErr, info = parser.parseFile(ctx, ctx.config.schemaPath, { formatHint = nil })
     if not ok then
         ctx.lastError = "Failed to parse schema: " .. tostring(schemaOrErr)
@@ -149,7 +212,7 @@ local function INITIALIZE(ctx)
     ctx.schema = schemaOrErr
     ctx.schemaInfo = info
 
-    logger.info("Computing build strategy...")
+    logger.log(ctx, "info", "Computing build strategy...")
     local order, boundsOrErr = buildOrder(ctx.schema, ctx.schemaInfo, ctx.config)
     if not order then
         ctx.lastError = "Failed to compute build order: " .. tostring(boundsOrErr)
@@ -159,9 +222,10 @@ local function INITIALIZE(ctx)
     ctx.strategy = order
     ctx.pointer = 1
     
-    logger.info(string.format("Plan: %d steps.", #order))
+    logger.log(ctx, "info", string.format("Plan: %d steps.", #order))
 
-    return "BUILD"
+    ctx.nextState = "BUILD"
+    return "CHECK_REQUIREMENTS"
 end
 
 return INITIALIZE

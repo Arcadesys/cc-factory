@@ -8,11 +8,12 @@ local fuelLib = require("lib_fuel")
 local logger = require("lib_logger")
 
 local function REFUEL(ctx)
-    logger.info("Refueling...")
+    logger.log(ctx, "info", "Refueling...")
     
     -- Go home
     local ok, err = movement.goTo(ctx, ctx.origin)
     if not ok then
+        ctx.resumeState = ctx.resumeState or "BUILD"
         return "BLOCKED"
     end
 
@@ -26,7 +27,11 @@ local function REFUEL(ctx)
     
     ---@diagnostic disable: undefined-global
     local needed = turtle.getFuelLimit() - turtle.getFuelLevel()
-    if needed <= 0 then return "BUILD" end
+    if needed <= 0 then
+        local resume = ctx.resumeState or "BUILD"
+        ctx.resumeState = nil
+        return resume
+    end
     
     -- Try to refuel from inventory first
     for i=1,16 do
@@ -37,10 +42,12 @@ local function REFUEL(ctx)
     end
     
     if turtle.getFuelLevel() > 1000 then
-        return "BUILD"
+        local resume = ctx.resumeState or "BUILD"
+        ctx.resumeState = nil
+        return resume
     end
     
-    logger.error("Out of fuel and no fuel items found.")
+    logger.log(ctx, "error", "Out of fuel and no fuel items found.")
     return "ERROR"
 end
 

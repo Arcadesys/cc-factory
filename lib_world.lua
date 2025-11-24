@@ -209,7 +209,9 @@ function world.computePrimaryPushDirection(ctx, periphSide)
         return "up"
     end
     return nil
-endfunction world.normaliseCoordinate(value)
+end
+
+function world.normaliseCoordinate(value)
     local number = tonumber(value)
     if number == nil then
         return nil
@@ -243,7 +245,9 @@ function world.normalisePosition(pos)
         return nil, "invalid_position"
     end
     return { x = x, y = y, z = z }
-endfunction world.normaliseFacing(facing)
+end
+
+function world.normaliseFacing(facing)
     facing = type(facing) == "string" and facing:lower() or "north"
     if facing ~= "north" and facing ~= "east" and facing ~= "south" and facing ~= "west" then
         return "north"
@@ -261,6 +265,9 @@ function world.facingVectors(facing)
         return { forward = { x = 0, z = 1 }, right = { x = -1, z = 0 } }
     else -- west
         return { forward = { x = -1, z = 0 }, right = { x = 0, z = -1 } }
+    end
+end
+
 function world.rotateLocalOffset(localOffset, facing)
     local vectors = world.facingVectors(facing)
     local dx = localOffset.x or 0
@@ -271,7 +278,9 @@ function world.rotateLocalOffset(localOffset, facing)
         x = (right.x * dx) + (forward.x * (-dz)),
         z = (right.z * dx) + (forward.z * (-dz)),
     }
-endfunction world.localToWorld(localOffset, facing)
+end
+
+function world.localToWorld(localOffset, facing)
     facing = world.normaliseFacing(facing)
     local dx = localOffset and localOffset.x or 0
     local dz = localOffset and localOffset.z or 0
@@ -282,6 +291,7 @@ endfunction world.localToWorld(localOffset, facing)
         z = rotated.z,
     }
 end
+
 function world.copyPosition(pos)
     if type(pos) ~= "table" then
         return nil
@@ -291,6 +301,43 @@ function world.copyPosition(pos)
         y = pos.y or 0,
         z = pos.z or 0,
     }
+end
+
+function world.detectContainers(io)
+    local found = {}
+    local sides = { "forward", "down", "up" }
+    local labels = {
+        forward = "front",
+        down = "below",
+        up = "above",
+    }
+    for _, side in ipairs(sides) do
+        local inspect
+        if side == "forward" then
+            inspect = turtle.inspect
+        elseif side == "up" then
+            inspect = turtle.inspectUp
+        else
+            inspect = turtle.inspectDown
+        end
+        if type(inspect) == "function" then
+            local ok, detail = inspect()
+            if ok then
+                local name = type(detail.name) == "string" and detail.name or "unknown"
+                found[#found + 1] = string.format(" %s: %s", labels[side] or side, name)
+            end
+        end
+    end
+    if io.print then
+        if #found == 0 then
+            io.print("Detected containers: <none>")
+        else
+            io.print("Detected containers:")
+            for _, line in ipairs(found) do
+                io.print(" -" .. line)
+            end
+        end
+    end
 end
 
 return world

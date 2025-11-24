@@ -9,6 +9,7 @@ local inventory = require("lib_inventory")
 local fuelLib = require("lib_fuel")
 local logger = require("lib_logger")
 local orientation = require("lib_orientation")
+local diagnostics = require("lib_diagnostics")
 
 local function localToWorld(localPos, facing)
     -- Transform local (x=right, z=forward) to world based on facing
@@ -65,11 +66,16 @@ local function addPos(p1, p2)
 end
 
 local function BUILD(ctx)
-    if ctx.pointer > #ctx.strategy then
+    local strategy, errMsg = diagnostics.requireStrategy(ctx)
+    if not strategy then
+        return "ERROR"
+    end
+
+    if ctx.pointer > #strategy then
         return "DONE"
     end
 
-    local step = ctx.strategy[ctx.pointer]
+    local step = strategy[ctx.pointer]
     local material = step.block.material
     
     -- 1. Check Fuel
@@ -77,14 +83,16 @@ local function BUILD(ctx)
     -- Real logic should be in REFUEL state or a robust check here.
     ---@diagnostic disable-next-line: undefined-global
     if turtle.getFuelLevel() < 100 and turtle.getFuelLevel() ~= "unlimited" then
+        ctx.resumeState = "BUILD"
         return "REFUEL"
     end
 
     -- 2. Check Inventory
     local count = inventory.countMaterial(ctx, material)
     if count == 0 then
-        logger.warn("Out of material: " .. material)
+        logger.log(ctx, "warn", "Out of material: " .. material)
         ctx.missingMaterial = material
+        ctx.resumeState = "BUILD"
         return "RESTOCK"
     end
 
@@ -99,7 +107,8 @@ local function BUILD(ctx)
     -- We might want a "travel clearance" (fly high) strategy, but for now direct.
     local ok, err = movement.goTo(ctx, targetPos)
     if not ok then
-        logger.warn("Movement blocked: " .. tostring(err))
+        logger.log(ctx, "warn", "Movement blocked: " .. tostring(err))
+        ctx.resumeState = "BUILD"
         return "BLOCKED"
     end
 
@@ -120,7 +129,7 @@ local function BUILD(ctx)
         if placeErr == "already_present" then
             -- It's fine
         else
-            logger.warn("Placement failed: " .. tostring(placeErr))
+            logger.log(ctx, "warn", "Placement failed: " .. tostring(placeErr))
             -- Could be empty inventory (handled above?) or something else.
             -- If it's "out of items", we should restock.
             -- But placeMaterial might not return specific enough error.
@@ -131,6 +140,7 @@ local function BUILD(ctx)
     end
 
     ctx.pointer = ctx.pointer + 1
+    ctx.retries = 0
     return "BUILD"
 end
 

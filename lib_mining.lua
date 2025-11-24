@@ -8,7 +8,6 @@ Handles ore detection, extraction, and hole filling.
 local mining = {}
 local inventory = require("lib_inventory")
 local movement = require("lib_movement")
-local placement = require("lib_placement")
 local logger = require("lib_logger")
 
 -- Blocks that are considered "trash" and should be ignored during ore scanning.
@@ -34,7 +33,8 @@ end
 
 --- Find a suitable trash block in inventory to use for filling
 local function findFillMaterial(ctx)
-    local state = inventory.scan(ctx)
+    inventory.scan(ctx)
+    local state = inventory.ensureState(ctx)
     if not state or not state.slots then return nil end
     for slot, item in pairs(state.slots) do
         if mining.TRASH_BLOCKS[item.name] and not mining.FILL_BLACKLIST[item.name] then

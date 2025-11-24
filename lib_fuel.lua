@@ -522,7 +522,10 @@ function fuel.isFuelLow(ctx)
         return false
     end
     return level <= threshold
-endfunction fuel.describeFuel(io, report)
+
+    end
+
+    function fuel.describeFuel(io, report)
     if not io.print then
         return
     end

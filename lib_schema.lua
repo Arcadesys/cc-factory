@@ -144,4 +144,37 @@ function schema_utils.fetchSchemaEntry(schema, pos)
     return block
 end
 
+function schema_utils.printMaterials(io, info)
+    if not io.print then
+        return
+    end
+    if not info or not info.materials or #info.materials == 0 then
+        io.print("Materials: <none>")
+        return
+    end
+    io.print("Materials:")
+    for _, entry in ipairs(info.materials) do
+        io.print(string.format(" - %s x%d", entry.material, entry.count))
+    end
+end
+
+function schema_utils.printBounds(io, info)
+    if not io.print then
+        return
+    end
+    if not info or not info.bounds or not info.bounds.min then
+        io.print("Bounds: <unknown>")
+        return
+    end
+    local minB = info.bounds.min
+    local maxB = info.bounds.max
+    local dims = {
+        x = (maxB.x - minB.x) + 1,
+        y = (maxB.y - minB.y) + 1,
+        z = (maxB.z - minB.z) + 1,
+    }
+    io.print(string.format("Bounds: min(%d,%d,%d) max(%d,%d,%d) dims(%d,%d,%d)",
+        minB.x, minB.y, minB.z, maxB.x, maxB.y, maxB.z, dims.x, dims.y, dims.z))
+end
+
 return schema_utils

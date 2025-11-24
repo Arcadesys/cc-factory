@@ -194,8 +194,10 @@ All library functions must fail gracefully.
 Computercraft turtles run best with a flat disk layout. Use filename prefixes to keep related states and libraries grouped without subdirectories.
 
 ```text
+factory.lua
 state_initialize.lua
 state_build.lua
+state_mine.lua
 state_restock.lua
 state_refuel.lua
 state_blocked.lua
@@ -208,15 +210,35 @@ lib_placement.lua
 lib_parser.lua
 lib_navigation.lua
 lib_logger.lua
+lib_mining.lua
+lib_strategy_branchmine.lua
 
-main.lua
 config.lua
 schema.json (or schema.txt)
 ```
 
 ---
 
-## **8. Future Extensions**
+## **8. Deployment Bundle**
+
+Uploading dozens of files to a turtle is painful, so use the bundler to produce a single `factory.lua` that contains every state and library:
+
+Create a `dist` directory first (the script does not create it automatically).
+
+1. From your development machine, run:
+
+    ```bash
+    node bundle.js
+    ```
+
+2. Copy the generated `dist/factory.lua` file onto the turtle (via `pastebin`, `wget`, disk, etc.).
+3. Launch the agent with `factory build <schema>` or `factory mine --length 80 --branch-interval 4`.
+
+The source files remain modular for development, but the turtle only needs the bundled artifact.
+
+---
+
+## **9. Future Extensions**
 
 * Multi-turtle cooperative building
 * Dynamic path optimization

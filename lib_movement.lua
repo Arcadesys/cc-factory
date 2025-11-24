@@ -233,9 +233,7 @@ local function ensureMovementState(ctx)
     local cfg = ctx.config or {}
 
     if not state.position then
-        if ctx.pointer then
-            state.position = copyPosition(ctx.pointer)
-        elseif ctx.origin then
+        if ctx.origin then
             state.position = copyPosition(ctx.origin)
         else
             state.position = { x = 0, y = 0, z = 0 }
@@ -751,6 +749,11 @@ function movement.turnBackOf(facing)
     else -- west
         return "east"
     end
+end
+function movement.describePosition(ctx)
+    local pos = movement.getPosition(ctx)
+    local facing = movement.getFacing(ctx)
+    return string.format("(x=%d, y=%d, z=%d, facing=%s)", pos.x, pos.y, pos.z, tostring(facing))
 end
 
 return movement
