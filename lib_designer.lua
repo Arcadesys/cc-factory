@@ -5,6 +5,7 @@ Graphical Schema Designer (Paint-style)
 local ui = require("lib_ui")
 local json = require("lib_json")
 local items = require("lib_items")
+local schema_utils = require("lib_schema")
 
 local designer = {}
 
@@ -46,48 +47,55 @@ local TOOLS = {
 
 -- --- State ---
 
-local state = {
-    running = true,
-    w = 14, h = 14, d = 5, -- Canvas dimensions
-    data = {}, -- [x][y][z] = material_index (0 or nil for air)
-    palette = {}, -- Initialized from DEFAULT_MATERIALS
-    paletteEditMode = false,
-    
-    view = {
+local state = {}
+
+local function resetState()
+    state.running = true
+    state.w = 14
+    state.h = 14
+    state.d = 5
+    state.data = {} -- [x][y][z] = material_index (0 or nil for air)
+    state.meta = {} -- [x][y][z] = meta table
+    state.palette = {}
+    state.paletteEditMode = false
+    state.offset = { x = 0, y = 0, z = 0 }
+
+    state.view = {
         layer = 0, -- Current Y level
         offsetX = 4, -- Screen X offset of canvas
         offsetY = 3, -- Screen Y offset of canvas
         scrollX = 0,
         scrollY = 0,
-    },
-    
-    menuOpen = false,
-    inventoryOpen = false,
-    searchOpen = false,
-    searchQuery = "",
-    searchResults = {},
-    searchScroll = 0,
-    dragItem = nil, -- { id, sym, color }
-    
-    tool = TOOLS.PENCIL,
-    primaryColor = 1, -- Index in palette
-    secondaryColor = 0, -- 0 = Air/Eraser
-    
-    mouse = {
+    }
+
+    state.menuOpen = false
+    state.inventoryOpen = false
+    state.searchOpen = false
+    state.searchQuery = ""
+    state.searchResults = {}
+    state.searchScroll = 0
+    state.dragItem = nil -- { id, sym, color }
+
+    state.tool = TOOLS.PENCIL
+    state.primaryColor = 1 -- Index in palette
+    state.secondaryColor = 0 -- 0 = Air/Eraser
+
+    state.mouse = {
         down = false,
         drag = false,
         startX = 0, startY = 0, -- Canvas coords
         currX = 0, currY = 0,   -- Canvas coords
         btn = 1
-    },
-    
-    status = "Ready"
-}
+    }
 
--- Initialize palette
-for i, m in ipairs(DEFAULT_MATERIALS) do
-    state.palette[i] = { id = m.id, color = m.color, sym = m.sym }
+    state.status = "Ready"
+
+    for i, m in ipairs(DEFAULT_MATERIALS) do
+        state.palette[i] = { id = m.id, color = m.color, sym = m.sym }
+    end
 end
+
+resetState()
 
 -- --- Helpers ---
 
@@ -102,17 +110,177 @@ local function getBlock(x, y, z)
     return state.data[x][y][z] or 0
 end
 
-local function setBlock(x, y, z, matIdx)
+local function setBlock(x, y, z, matIdx, meta)
     if x < 0 or x >= state.w or z < 0 or z >= state.h or y < 0 or y >= state.d then return end
-    
+
     if not state.data[x] then state.data[x] = {} end
     if not state.data[x][y] then state.data[x][y] = {} end
-    
+    if not state.meta[x] then state.meta[x] = {} end
+    if not state.meta[x][y] then state.meta[x][y] = {} end
+
     if matIdx == 0 then
         state.data[x][y][z] = nil
+        if state.meta[x] and state.meta[x][y] then
+            state.meta[x][y][z] = nil
+        end
     else
         state.data[x][y][z] = matIdx
+        state.meta[x][y][z] = meta or {}
     end
+end
+
+local function getBlockMeta(x, y, z)
+    if not state.meta[x] or not state.meta[x][y] then return {} end
+    return schema_utils.cloneMeta(state.meta[x][y][z])
+end
+
+local function findItemDef(id)
+    for _, item in ipairs(items) do
+        if item.id == id then
+            return item
+        end
+    end
+    return nil
+end
+
+local function ensurePaletteMaterial(material)
+    for idx, mat in ipairs(state.palette) do
+        if mat.id == material then
+            return idx
+        end
+    end
+
+    local fallback = findItemDef(material)
+    local entry = {
+        id = material,
+        color = fallback and fallback.color or colors.white,
+        sym = fallback and fallback.sym or "?",
+    }
+
+    table.insert(state.palette, entry)
+    return #state.palette
+end
+
+local function clearCanvas()
+    state.data = {}
+    state.meta = {}
+end
+
+local function loadCanonical(schema, metadata)
+    if type(schema) ~= "table" then
+        return false, "invalid_schema"
+    end
+
+    clearCanvas()
+
+    local bounds = schema_utils.newBounds()
+    local blockCount = 0
+
+    for xKey, xColumn in pairs(schema) do
+        if type(xColumn) == "table" then
+            local x = tonumber(xKey) or xKey
+            if type(x) ~= "number" then return false, "invalid_coordinate" end
+            for yKey, yColumn in pairs(xColumn) do
+                if type(yColumn) == "table" then
+                    local y = tonumber(yKey) or yKey
+                    if type(y) ~= "number" then return false, "invalid_coordinate" end
+                    for zKey, block in pairs(yColumn) do
+                        if type(block) == "table" and block.material then
+                            local z = tonumber(zKey) or zKey
+                            if type(z) ~= "number" then return false, "invalid_coordinate" end
+                            schema_utils.updateBounds(bounds, x, y, z)
+                            blockCount = blockCount + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if blockCount == 0 then
+        state.status = "Loaded empty schema"
+        return true
+    end
+
+    state.offset = {
+        x = bounds.min.x,
+        y = bounds.min.y,
+        z = bounds.min.z,
+    }
+
+    state.w = math.max(1, (bounds.max.x - bounds.min.x) + 1)
+    state.d = math.max(1, (bounds.max.y - bounds.min.y) + 1)
+    state.h = math.max(1, (bounds.max.z - bounds.min.z) + 1)
+
+    for xKey, xColumn in pairs(schema) do
+        if type(xColumn) == "table" then
+            local x = tonumber(xKey) or xKey
+            if type(x) ~= "number" then return false, "invalid_coordinate" end
+            for yKey, yColumn in pairs(xColumn) do
+                if type(yColumn) == "table" then
+                    local y = tonumber(yKey) or yKey
+                    if type(y) ~= "number" then return false, "invalid_coordinate" end
+                    for zKey, block in pairs(yColumn) do
+                        if type(block) == "table" and block.material then
+                            local z = tonumber(zKey) or zKey
+                            if type(z) ~= "number" then return false, "invalid_coordinate" end
+                            local matIdx = ensurePaletteMaterial(block.material)
+                            local localX = x - state.offset.x
+                            local localY = y - state.offset.y
+                            local localZ = z - state.offset.z
+                            setBlock(localX, localY, localZ, matIdx, schema_utils.cloneMeta(block.meta))
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    state.status = string.format("Loaded %d blocks", blockCount)
+    if metadata and metadata.path then
+        state.status = state.status .. " from " .. metadata.path
+    end
+
+    return true
+end
+
+local function exportCanonical()
+    local schema = {}
+    local bounds = schema_utils.newBounds()
+    local total = 0
+
+    for x, xColumn in pairs(state.data) do
+        for y, yColumn in pairs(xColumn) do
+            for z, matIdx in pairs(yColumn) do
+                local mat = getMaterial(matIdx)
+                if mat then
+                    local worldX = x + state.offset.x
+                    local worldY = y + state.offset.y
+                    local worldZ = z + state.offset.z
+                    schema[worldX] = schema[worldX] or {}
+                    schema[worldX][worldY] = schema[worldX][worldY] or {}
+                    schema[worldX][worldY][worldZ] = {
+                        material = mat.id,
+                        meta = getBlockMeta(x, y, z),
+                    }
+                    schema_utils.updateBounds(bounds, worldX, worldY, worldZ)
+                    total = total + 1
+                end
+            end
+        end
+    end
+
+    local info = { totalBlocks = total }
+    if total > 0 then
+        info.bounds = bounds
+    end
+
+    return schema, info
+end
+
+local function exportVoxelDefinition()
+    local canonical, info = exportCanonical()
+    return schema_utils.canonicalToVoxelDefinition(canonical), info
 end
 
 -- --- Algorithms ---
@@ -509,23 +677,10 @@ local function saveSchema()
     if name == "" then return end
     if not name:find("%.json$") then name = name .. ".json" end
     
-    -- Convert to sparse format for saving
-    local export = {}
-    for x, yRow in pairs(state.data) do
-        for y, zRow in pairs(yRow) do
-            for z, matIdx in pairs(zRow) do
-                local mat = getMaterial(matIdx)
-                if mat then
-                    if not export[tostring(x)] then export[tostring(x)] = {} end
-                    if not export[tostring(x)][tostring(y)] then export[tostring(x)][tostring(y)] = {} end
-                    export[tostring(x)][tostring(y)][tostring(z)] = { material = mat.id }
-                end
-            end
-        end
-    end
-    
+    local exportDef = exportVoxelDefinition()
+
     local f = fs.open(name, "w")
-    f.write(json.encode(export))
+    f.write(json.encode(exportDef))
     f.close()
     state.status = "Saved to " .. name
 end
@@ -621,9 +776,19 @@ end
 
 -- --- Main ---
 
-function designer.run()
+function designer.run(opts)
+    opts = opts or {}
+    resetState()
+
+    if opts.schema then
+        local ok, err = loadCanonical(opts.schema, opts.metadata)
+        if not ok then
+            return false, err
+        end
+    end
+
     state.running = true
-    
+
     while state.running do
         drawUI()
         drawCanvas()
@@ -631,29 +796,29 @@ function designer.run()
         drawInventory()
         drawSearch()
         drawDragItem()
-        
+
         local event, p1, p2, p3 = os.pullEvent()
-        
+
         if event == "char" and state.searchOpen then
             state.searchQuery = state.searchQuery .. p1
             updateSearchResults()
-            
+
         elseif event == "mouse_scroll" and state.searchOpen then
             local dir = p1
             state.searchScroll = math.max(0, state.searchScroll + dir)
-            
+
         elseif event == "mouse_click" then
             local btn, mx, my = p1, p2, p3
             state.mouse.screenX = mx
             state.mouse.screenY = my
             local handled = false
-            
+
             -- 0. Check Search (Topmost)
             if state.searchOpen then
                 local w, h = term.getSize()
                 local sw, sh = 24, 14
                 local sx, sy = math.floor((w - sw)/2), math.floor((h - sh)/2)
-                
+
                 if mx >= sx and mx < sx + sw and my >= sy and my < sy + sh then
                     -- Inside Search Window
                     if my >= sy + 3 then
@@ -670,7 +835,7 @@ function designer.run()
                     handled = true
                 end
             end
-            
+
             -- 1. Check Menu (Topmost)
             if not handled and state.menuOpen then
                 local w, h = term.getSize()
@@ -683,7 +848,7 @@ function designer.run()
                         elseif options[idx] == "Inventory" then state.inventoryOpen = not state.inventoryOpen
                         elseif options[idx] == "Resize" then resizeCanvas()
                         elseif options[idx] == "Save" then saveSchema()
-                        elseif options[idx] == "Clear" then state.data = {}
+                        elseif options[idx] == "Clear" then clearCanvas()
                         -- Load logic...
                         end
                         if options[idx] ~= "Inventory" then state.menuOpen = false end
@@ -695,13 +860,13 @@ function designer.run()
                     handled = true -- Consume click
                 end
             end
-            
+
             -- 2. Check Inventory (Topmost)
             if not handled and state.inventoryOpen then
                 local w, h = term.getSize()
                 local iw, ih = 18, 6
                 local ix, iy = math.floor((w - iw)/2), math.floor((h - ih)/2)
-                
+
                 if mx >= ix and mx < ix + iw and my >= iy and my < iy + ih then
                     -- Check slot click
                     local relX, relY = mx - ix - 1, my - iy - 1
@@ -723,13 +888,13 @@ function designer.run()
                     handled = true
                 end
             end
-            
+
             -- 3. Check [M] Button
             if not handled and mx >= 1 and mx <= 3 and my == 1 then
                 state.menuOpen = not state.menuOpen
                 handled = true
             end
-            
+
             -- 4. Check Palette (Drop Target & Selection)
             local palX = 2 + state.w + 2
             if not handled and mx >= palX and mx <= palX + 18 then -- Expanded for Search button
@@ -737,8 +902,8 @@ function designer.run()
                     -- Check Edit vs Search
                     if mx >= palX + 16 and mx <= palX + 18 then
                         state.searchOpen = not state.searchOpen
-                        if state.searchOpen then 
-                            state.searchQuery = "" 
+                        if state.searchOpen then
+                            state.searchQuery = ""
                             updateSearchResults()
                         end
                     elseif mx <= palX + 15 then
@@ -756,7 +921,7 @@ function designer.run()
                     handled = true
                 end
             end
-            
+
             -- 5. Check Tools
             if not handled and mx >= 1 and mx <= 3 and my >= 3 and my < 3 + 8 then
                 local idx = my - 2
@@ -764,12 +929,12 @@ function designer.run()
                 if toolsList[idx] then state.tool = toolsList[idx] end
                 handled = true
             end
-            
+
             -- 6. Check Canvas
             if not handled then
                 local cx = mx - state.view.offsetX
                 local cy = my - state.view.offsetY
-                
+
                 if cx >= 0 and cx < state.w and cy >= 0 and cy < state.h then
                     state.mouse.down = true
                     state.mouse.btn = btn
@@ -777,37 +942,37 @@ function designer.run()
                     state.mouse.startY = cy
                     state.mouse.currX = cx
                     state.mouse.currY = cy
-                    
+
                     if state.tool == TOOLS.PENCIL or state.tool == TOOLS.BUCKET or state.tool == TOOLS.PICKER then
                         applyTool(cx, cy, btn)
                     end
                 end
             end
-            
+
         elseif event == "mouse_drag" then
             local btn, mx, my = p1, p2, p3
             state.mouse.screenX = mx
             state.mouse.screenY = my
             local cx = mx - state.view.offsetX
             local cy = my - state.view.offsetY
-            
+
             if state.mouse.down then
                 -- Clamp to canvas
                 cx = math.max(0, math.min(state.w - 1, cx))
                 cy = math.max(0, math.min(state.h - 1, cy))
-                
+
                 state.mouse.currX = cx
                 state.mouse.currY = cy
                 state.mouse.drag = true
-                
+
                 if state.tool == TOOLS.PENCIL then
                     applyTool(cx, cy, state.mouse.btn)
                 end
             end
-            
+
         elseif event == "mouse_up" then
             local btn, mx, my = p1, p2, p3
-            
+
             -- Handle Drag Drop to Palette
             if state.dragItem then
                 local palX = 2 + state.w + 2
@@ -828,10 +993,10 @@ function designer.run()
             end
             state.mouse.down = false
             state.mouse.drag = false
-            
+
         elseif event == "key" then
             local key = p1
-            
+
             if state.searchOpen then
                 if key == keys.backspace then
                     state.searchQuery = state.searchQuery:sub(1, -2)
@@ -851,12 +1016,20 @@ function designer.run()
                 if key == keys.q then state.running = false end
                 if key == keys.s then saveSchema() end
                 if key == keys.r then resizeCanvas() end
-                if key == keys.c then state.data = {} end -- Clear all
+                if key == keys.c then clearCanvas() end -- Clear all
                 if key == keys.pageUp then state.view.layer = math.min(state.d - 1, state.view.layer + 1) end
                 if key == keys.pageDown then state.view.layer = math.max(0, state.view.layer - 1) end
             end
         end
     end
+
+    if opts.returnSchema then
+        return exportCanonical()
+    end
 end
+
+designer.loadCanonical = loadCanonical
+designer.exportCanonical = exportCanonical
+designer.exportVoxelDefinition = exportVoxelDefinition
 
 return designer
